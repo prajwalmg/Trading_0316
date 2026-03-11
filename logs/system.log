@@ -1,0 +1,79 @@
+2026-03-11 18:44:36,832 [INFO] trading_firm.main — ============================================================
+2026-03-11 18:44:36,832 [INFO] trading_firm.main — MODE: TRAIN
+2026-03-11 18:44:36,832 [INFO] trading_firm.main — ============================================================
+2026-03-11 18:44:37,936 [ERROR] trading_firm.data — EURUSD=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:37,937 [WARNING] trading_firm.data — No data for EURUSD=X — skipping
+2026-03-11 18:44:38,639 [ERROR] trading_firm.data — GBPUSD=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:38,639 [WARNING] trading_firm.data — No data for GBPUSD=X — skipping
+2026-03-11 18:44:39,361 [ERROR] trading_firm.data — USDJPY=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:39,361 [WARNING] trading_firm.data — No data for USDJPY=X — skipping
+2026-03-11 18:44:40,189 [ERROR] trading_firm.data — AUDUSD=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:40,190 [WARNING] trading_firm.data — No data for AUDUSD=X — skipping
+2026-03-11 18:44:40,825 [ERROR] trading_firm.data — AAPL: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:40,826 [WARNING] trading_firm.data — No data for AAPL — skipping
+2026-03-11 18:44:41,424 [ERROR] trading_firm.data — MSFT: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:41,424 [WARNING] trading_firm.data — No data for MSFT — skipping
+2026-03-11 18:44:42,105 [ERROR] trading_firm.data — GC=F: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:42,105 [WARNING] trading_firm.data — No data for GC=F — skipping
+2026-03-11 18:44:43,170 [ERROR] trading_firm.data — CL=F: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:44:43,170 [WARNING] trading_firm.data — No data for CL=F — skipping
+2026-03-11 18:44:43,170 [WARNING] trading_firm.data — Failed to fetch: ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X', 'AAPL', 'MSFT', 'GC=F', 'CL=F']
+2026-03-11 18:44:43,170 [INFO] trading_firm.data — DataPipeline refreshed: 0 instruments (8 failed)
+2026-03-11 18:44:43,170 [WARNING] trading_firm.main — EURUSD=X: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — GBPUSD=X: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — USDJPY=X: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — AUDUSD=X: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — AAPL: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — MSFT: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — GC=F: no data — skipping
+2026-03-11 18:44:43,171 [WARNING] trading_firm.main — CL=F: no data — skipping
+2026-03-11 18:56:00,704 [INFO] trading_firm.main — ============================================================
+2026-03-11 18:56:00,704 [INFO] trading_firm.main — MODE: TRAIN
+2026-03-11 18:56:00,704 [INFO] trading_firm.main — ============================================================
+2026-03-11 18:56:01,827 [ERROR] trading_firm.data — EURUSD=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:01,828 [WARNING] trading_firm.data — No data for EURUSD=X — skipping
+2026-03-11 18:56:11,842 [ERROR] yfinance — 
+1 Failed download:
+2026-03-11 18:56:11,842 [ERROR] yfinance — ['GBPUSD=X']: TypeError("'NoneType' object is not subscriptable")
+2026-03-11 18:56:11,852 [ERROR] trading_firm.data — GBPUSD=X: yfinance fetch failed — No data returned for GBPUSD=X
+2026-03-11 18:56:11,852 [WARNING] trading_firm.data — No data for GBPUSD=X — skipping
+2026-03-11 18:56:19,605 [ERROR] trading_firm.data — USDJPY=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:19,606 [WARNING] trading_firm.data — No data for USDJPY=X — skipping
+2026-03-11 18:56:20,141 [ERROR] trading_firm.data — AUDUSD=X: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:20,141 [WARNING] trading_firm.data — No data for AUDUSD=X — skipping
+2026-03-11 18:56:20,589 [ERROR] trading_firm.data — AAPL: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:20,590 [WARNING] trading_firm.data — No data for AAPL — skipping
+2026-03-11 18:56:20,978 [ERROR] trading_firm.data — MSFT: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:20,979 [WARNING] trading_firm.data — No data for MSFT — skipping
+2026-03-11 18:56:21,492 [ERROR] trading_firm.data — GC=F: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:21,493 [WARNING] trading_firm.data — No data for GC=F — skipping
+2026-03-11 18:56:28,059 [ERROR] trading_firm.data — CL=F: yfinance fetch failed — 'tuple' object has no attribute 'lower'
+2026-03-11 18:56:28,060 [WARNING] trading_firm.data — No data for CL=F — skipping
+2026-03-11 18:56:28,060 [WARNING] trading_firm.data — Failed to fetch: ['EURUSD=X', 'GBPUSD=X', 'USDJPY=X', 'AUDUSD=X', 'AAPL', 'MSFT', 'GC=F', 'CL=F']
+2026-03-11 18:56:28,060 [INFO] trading_firm.data — DataPipeline refreshed: 0 instruments (8 failed)
+2026-03-11 18:56:28,060 [WARNING] trading_firm.main — EURUSD=X: no data — skipping
+2026-03-11 18:56:28,060 [WARNING] trading_firm.main — GBPUSD=X: no data — skipping
+2026-03-11 18:56:28,060 [WARNING] trading_firm.main — USDJPY=X: no data — skipping
+2026-03-11 18:56:28,060 [WARNING] trading_firm.main — AUDUSD=X: no data — skipping
+2026-03-11 18:56:28,061 [WARNING] trading_firm.main — AAPL: no data — skipping
+2026-03-11 18:56:28,061 [WARNING] trading_firm.main — MSFT: no data — skipping
+2026-03-11 18:56:28,061 [WARNING] trading_firm.main — GC=F: no data — skipping
+2026-03-11 18:56:28,061 [WARNING] trading_firm.main — CL=F: no data — skipping
+2026-03-11 18:57:57,648 [INFO] trading_firm.main — ============================================================
+2026-03-11 18:57:57,648 [INFO] trading_firm.main — MODE: TRAIN
+2026-03-11 18:57:57,648 [INFO] trading_firm.main — ============================================================
+2026-03-11 18:58:11,698 [INFO] trading_firm.data — EURUSD=X: fetched 16551 bars @ 5m
+2026-03-11 18:58:12,526 [INFO] trading_firm.data — GBPUSD=X: fetched 16558 bars @ 5m
+2026-03-11 18:58:13,391 [INFO] trading_firm.data — USDJPY=X: fetched 16246 bars @ 5m
+2026-03-11 18:58:14,685 [INFO] trading_firm.data — AUDUSD=X: fetched 16896 bars @ 5m
+2026-03-11 18:58:15,417 [INFO] trading_firm.data — AAPL: fetched 4561 bars @ 5m
+2026-03-11 18:58:15,939 [INFO] trading_firm.data — MSFT: fetched 4562 bars @ 5m
+2026-03-11 18:58:16,576 [INFO] trading_firm.data — GC=F: fetched 13507 bars @ 5m
+2026-03-11 18:58:17,148 [INFO] trading_firm.data — CL=F: fetched 13348 bars @ 5m
+2026-03-11 18:58:17,148 [INFO] trading_firm.data — DataPipeline refreshed: 8 instruments (0 failed)
+2026-03-11 18:58:20,136 [WARNING] trading_firm.main — EURUSD=X: only 0 samples — skipping
+2026-03-11 18:58:23,602 [WARNING] trading_firm.main — GBPUSD=X: only 0 samples — skipping
+2026-03-11 18:58:26,642 [WARNING] trading_firm.main — USDJPY=X: only 0 samples — skipping
+2026-03-11 18:58:29,609 [WARNING] trading_firm.main — AUDUSD=X: only 0 samples — skipping
+2026-03-11 18:58:30,398 [INFO] trading_firm.main — AAPL: 4512 samples | classes: {np.int64(-1): np.int64(2172), np.int64(0): np.int64(293), np.int64(1): np.int64(2047)}
+2026-03-11 18:58:30,398 [INFO] trading_firm.ensemble — [AAPL] Training stacked ensemble | samples=4512 | features=53
