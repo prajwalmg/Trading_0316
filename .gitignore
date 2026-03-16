@@ -69,3 +69,10 @@ htmlcov/
 *.tmp
 *.bak
 *.orig
+*.csv
+*.pkl
+*.parquet
+*.h5
+data/
+models/
+venv/
