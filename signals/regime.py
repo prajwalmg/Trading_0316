@@ -152,10 +152,55 @@ class RegimeTracker:
         self._regimes:  dict = {}    # {ticker: current_regime}
         self._history:  dict = {}    # {ticker: pd.Series of regimes}
 
+    def _htf_regime(self, df: pd.DataFrame) -> str:
+        """
+        Cross-timeframe regime confirmation using 4h and daily trends.
+        Both timeframes must agree for a strong trend classification.
+        Falls back to ranging if they disagree.
+        """
+        try:
+            c = df["close"]
+
+            # 4-hour trend
+            c_4h     = c.resample("4h").last().ffill()
+            ema_4h   = c_4h.ewm(span=20).mean()
+            trend_4h = 1 if c_4h.iloc[-1] > ema_4h.iloc[-1] else -1
+
+            # Daily trend
+            c_1d     = c.resample("1D").last().ffill()
+            ema_1d   = c_1d.ewm(span=20).mean()
+            trend_1d = 1 if c_1d.iloc[-1] > ema_1d.iloc[-1] else -1
+
+            if trend_4h == 1 and trend_1d == 1:
+                return "trending_up"
+            elif trend_4h == -1 and trend_1d == -1:
+                return "trending_down"
+            else:
+                return "ranging"
+        except Exception:
+            return "ranging"
+
+
     def update(self, ticker: str, df: pd.DataFrame):
         regime_series         = detect_regime(df)
         self._history[ticker] = regime_series
-        self._regimes[ticker] = regime_series.iloc[-1] if len(regime_series) else "ranging"
+        base_regime           = regime_series.iloc[-1] if len(regime_series) else "ranging"
+
+        # HTF confirmation — only call strong trend if HTF agrees
+        htf_regime = self._htf_regime(df)
+
+        if base_regime in ("trending_up", "trending_down"):
+            # Only keep strong trend if HTF confirms it
+            final_regime = base_regime if htf_regime == base_regime else "ranging"
+        elif base_regime == "high_volatility":
+        # Keep high_vol regardless — it's a risk signal
+            final_regime = base_regime
+        else:
+        # Ranging — upgrade to trend if HTF strongly disagrees
+            final_regime = htf_regime if htf_regime != "ranging" else base_regime
+
+        self._regimes[ticker] = final_regime
+
 
     def current(self, ticker: str) -> str:
         return self._regimes.get(ticker, "ranging")

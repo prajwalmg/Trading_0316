@@ -1,0 +1,71 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg
+*.egg-info/
+dist/
+build/
+eggs/
+parts/
+var/
+sdist/
+wheels/
+pip-wheel-metadata/
+*.spec
+
+# Virtual environment
+venv/
+env/
+ENV/
+.venv/
+
+# Trained models — too large for GitHub, regenerate with train command
+models/saved/*.pkl
+
+# Data cache — regenerated automatically
+data/cache/
+
+# Live trading logs — sensitive and large
+logs/
+
+# Feedback data — personal trade history
+logs/feedback/
+
+# Scheduler timestamps
+models/saved/last_train_*.txt
+
+# API keys and secrets
+.env
+*.env
+config/secrets.py
+secrets.py
+
+# macOS
+.DS_Store
+.AppleDouble
+.LSOverride
+Thumbs.db
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Jupyter
+.ipynb_checkpoints/
+*.ipynb
+
+# Test artifacts
+.pytest_cache/
+.coverage
+htmlcov/
+
+# Temporary files
+*.tmp
+*.bak
+*.orig

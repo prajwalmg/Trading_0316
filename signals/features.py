@@ -181,7 +181,7 @@ def add_session(df: pd.DataFrame) -> pd.DataFrame:
 
     return df
 
-
+"""
 def add_volume(df: pd.DataFrame) -> pd.DataFrame:
     vol = df["volume"].replace(0, np.nan)
     c   = df["close"]
@@ -199,6 +199,63 @@ def add_volume(df: pd.DataFrame) -> pd.DataFrame:
     df["vwap_dist"] = (c - df["vwap"]) / c
 
     return df
+"""
+
+def add_volume(df: pd.DataFrame) -> pd.DataFrame:
+    vol = df["volume"].replace(0, np.nan)
+    c   = df["close"]
+    h   = df["high"]
+    l   = df["low"]
+
+    # If volume is all zero (forex), fill defaults so ratios don't explode
+    if vol.isna().mean() > 0.5:
+        for col in [
+            "vol_ratio", "vol_z", "obv", "obv_ema", "obv_sig",
+            "buy_volume", "sell_volume", "vol_imbalance", "vol_delta_z",
+        ]:
+            df[col] = 0.0
+        df["vwap"]      = c
+        df["vwap_dist"] = 0.0
+        return df
+
+    df["vol_ratio"] = vol / vol.rolling(20).mean()
+    df["vol_z"]     = (vol - vol.rolling(20).mean()) / (vol.rolling(20).std() + 1e-9)
+
+    df["obv"]       = (np.sign(c.diff()) * vol.fillna(0)).fillna(0).cumsum()
+    df["obv_ema"]   = df["obv"].ewm(span=10).mean()
+    df["obv_sig"]   = (df["obv"] - df["obv_ema"]) / (vol.rolling(20).mean().fillna(1) + 1e-9)
+
+    df["vwap"]      = (vol * (h + l + c) / 3).rolling(20).sum() / (vol.rolling(20).sum() + 1e-9)
+    df["vwap_dist"] = (c - df["vwap"]) / c
+
+    # ── Volume profile ────────────────────────────────────────
+    bar_range           = (h - l).replace(0, 1e-9)
+    buy_ratio           = (c - l) / bar_range
+    df["buy_volume"]    = vol * buy_ratio
+    df["sell_volume"]   = vol * (1 - buy_ratio)
+
+    df["vol_imbalance"] = (
+        df["buy_volume"].rolling(10).sum() /
+        (df["sell_volume"].rolling(10).sum() + 1e-9)
+    ).clip(0, 5)
+
+    vol_delta           = (df["buy_volume"] - df["sell_volume"]).rolling(20).sum()
+    df["vol_delta_z"]   = (
+        (vol_delta - vol_delta.rolling(50).mean()) /
+        (vol_delta.rolling(50).std() + 1e-9)
+    )
+
+    # Add before return df:
+    vol_cols = [
+        "vol_ratio", "vol_z", "obv", "obv_ema", "obv_sig",
+        "vwap", "vwap_dist", "buy_volume", "sell_volume",
+        "vol_imbalance", "vol_delta_z",
+    ]
+    for col in vol_cols:
+        if col in df.columns:
+            df[col] = df[col].fillna(0)
+
+    return df
 
 
 def add_target(df: pd.DataFrame, horizon: int = FEATURE_HORIZON) -> pd.DataFrame:
@@ -214,36 +271,310 @@ def add_target(df: pd.DataFrame, horizon: int = FEATURE_HORIZON) -> pd.DataFrame
     return df
 
 
+def add_microstructure(df: pd.DataFrame) -> pd.DataFrame:
+    """Price microstructure features for intraday trading."""
+    c = df["close"]
+    h = df["high"]
+    l = df["low"]
+    o = df["open"]
+
+    # Candle body ratio — how much of the bar was directional vs noise
+    bar_range = (h - l).replace(0, 1e-9)
+    df["body_ratio"]   = (c - o).abs() / bar_range
+    df["upper_shadow"]  = (h - df[["open","close"]].max(axis=1)) / bar_range
+    df["lower_shadow"]  = (df[["open","close"]].min(axis=1) - l) / bar_range
+
+    # Price efficiency ratio — how efficiently price moved over last 10 bars
+    net_move   = (c - c.shift(10)).abs()
+    total_path = c.diff().abs().rolling(10).sum().replace(0, 1e-9)
+    df["efficiency_ratio"] = net_move / total_path
+
+    # Bar-over-bar momentum consistency
+    df["mom_consistency"] = (
+        c.diff().gt(0).astype(int)
+         .rolling(10).mean()
+    )
+
+    # Volatility ratio — current bar range vs recent average range
+    avg_range = bar_range.rolling(20).mean().replace(0, 1e-9)
+    df["range_ratio"] = bar_range / avg_range
+
+    return df
+
+
+def add_stationary_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Stationary features that have identical distributions
+    regardless of window size — critical for train/live consistency.
+    """
+    c = df["close"]
+    h = df["high"]
+    l = df["low"]
+    v = df["volume"].fillna(0)
+
+    # Returns — always stationary
+    df["ret_1"]  = c.pct_change(1).clip(-0.1, 0.1)
+    df["ret_5"]  = c.pct_change(5).clip(-0.2, 0.2)
+    df["ret_20"] = c.pct_change(20).clip(-0.3, 0.3)
+
+    # Position in recent range — bounded 0 to 1
+    roll_high         = h.rolling(20).max()
+    roll_low          = l.rolling(20).min()
+    df["range_pos"]   = (c - roll_low) / (roll_high - roll_low + 1e-9)
+
+    # ATR as percentage — stationary
+    atr               = df["atr"] if "atr" in df.columns else c.rolling(14).std()
+    df["atr_pct"]     = (atr / c).clip(0, 0.1)
+
+    # Normalised RSI — centred at 0
+    rsi               = df["rsi"] if "rsi" in df.columns else pd.Series(50, index=df.index)
+    df["rsi_norm"]    = (rsi - 50) / 50   # bounded -1 to +1
+
+    # Volume z-score — stationary
+    vol_mean          = v.rolling(20).mean().replace(0, 1e-9)
+    df["vol_zscore"]  = ((v - vol_mean) / (v.rolling(20).std() + 1e-9)).clip(-5, 5)
+
+    # Trend alignment — categorical
+    ema20             = c.ewm(span=20).mean()
+    ema50             = c.ewm(span=50).mean()
+    df["trend_align"] = np.sign(ema20 - ema50).astype(int)
+
+    return df
+
+
+def add_order_flow(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Order flow features — best short-term predictor of price direction.
+    """
+    c = df["close"]
+    h = df["high"]
+    l = df["low"]
+    v = df["volume"].fillna(0)
+
+    bar_range         = (h - l).replace(0, 1e-9)
+    buy_frac          = (c - l) / bar_range
+    buy_vol           = v * buy_frac
+    sell_vol          = v * (1 - buy_frac)
+
+    # Cumulative delta — running buy/sell imbalance
+    delta             = buy_vol - sell_vol
+    cum_delta         = delta.rolling(20).sum()
+    df["delta_z"]     = (
+        (cum_delta - cum_delta.rolling(50).mean()) /
+        (cum_delta.rolling(50).std() + 1e-9)
+    ).clip(-5, 5)
+
+    # Buy/sell ratio
+    df["bs_ratio"]    = (
+        buy_vol.rolling(10).sum() /
+        (sell_vol.rolling(10).sum() + 1e-9)
+    ).clip(0, 5)
+
+    # Tick direction consistency
+    df["tick_consist"] = np.sign(c.diff()).rolling(10).mean()
+
+    return df
+
+
+def add_session_overlaps(df: pd.DataFrame) -> pd.DataFrame:
+    """Mark high-liquidity session overlap periods."""
+    h = df.index.hour
+
+    # London/NY overlap (13:00–17:00 UTC) — highest liquidity
+    df["london_ny_overlap"] = ((h >= 13) & (h < 17)).astype(int)
+
+    # London open (07:00–09:00 UTC) — second highest
+    df["london_open"] = ((h >= 7) & (h < 9)).astype(int)
+
+    # NY open (14:30–16:00 UTC) — high volatility
+    df["ny_open"] = ((h >= 14) & (h < 16)).astype(int)
+
+    # Asian session (00:00–07:00 UTC) — low liquidity, avoid
+    df["asian_session"] = ((h >= 0) & (h < 7)).astype(int)
+
+    return df
+
+
+def add_labels_col(df: pd.DataFrame, forward_bars: int = 12,
+                   sl_mult: float = 1.5, tp_mult: float = 2.0) -> pd.DataFrame:
+    """
+    Triple barrier labels — matches exactly how trades are executed.
+    +1 = TP hit first
+    -1 = SL hit first
+     0 = Time barrier (neither hit in forward_bars)
+    """
+    if "atr" not in df.columns:
+        df["atr"] = df["close"].rolling(14).std()
+
+    labels = pd.Series(0, index=df.index)
+    close  = df["close"].values
+    atr    = df["atr"].values
+    n      = len(df)
+
+    for i in range(n - forward_bars):
+        entry  = close[i]
+        tp     = entry + tp_mult * atr[i]
+        sl     = entry - sl_mult * atr[i]
+        future = close[i+1 : i+forward_bars+1]
+
+        tp_idx = next((j for j, p in enumerate(future) if p >= tp), None)
+        sl_idx = next((j for j, p in enumerate(future) if p <= sl), None)
+
+        if tp_idx is not None and sl_idx is not None:
+            labels.iloc[i] = 1 if tp_idx < sl_idx else -1
+        elif tp_idx is not None:
+            labels.iloc[i] = 1
+        elif sl_idx is not None:
+            labels.iloc[i] = -1
+        # else 0 — time barrier
+
+    df["label"] = labels
+    return df
+
+
+def add_htf_context(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Extended HTF context — our strongest predictive signal.
+    """
+    try:
+        c = df["close"]
+
+        # Existing: 15min and 1h trends
+        c_15m    = c.resample("15min").last().ffill()
+        ema_15m  = c_15m.ewm(span=20).mean()
+        trend_15m = pd.Series(
+            np.where(c_15m > ema_15m, 1, -1),
+            index=c_15m.index
+        ).reindex(df.index, method="ffill").fillna(0)
+
+        c_1h     = c.resample("1h").last().ffill()
+        ema_1h   = c_1h.ewm(span=20).mean()
+        trend_1h = pd.Series(
+            np.where(c_1h > ema_1h, 1, -1),
+            index=c_1h.index
+        ).reindex(df.index, method="ffill").fillna(0)
+
+        # NEW: 4h trend — medium term direction
+        c_4h     = c.resample("4h").last().ffill()
+        ema_4h   = c_4h.ewm(span=20).mean()
+        trend_4h = pd.Series(
+            np.where(c_4h > ema_4h, 1, -1),
+            index=c_4h.index
+        ).reindex(df.index, method="ffill").fillna(0)
+
+        # NEW: HTF momentum — how strongly is the trend moving
+        c_1h_ret = c_1h.pct_change(5).reindex(df.index, method="ffill").fillna(0)
+
+        # NEW: Trend consistency — are all timeframes aligned
+        trend_consistency = (
+            (trend_15m == trend_1h).astype(int) +
+            (trend_1h  == trend_4h).astype(int)
+        ) / 2   # 0, 0.5, or 1.0
+
+        df["trend_15m"]          = trend_15m
+        df["trend_1h"]           = trend_1h
+        df["trend_4h"]           = trend_4h   # new
+        df["htf_momentum"]       = c_1h_ret.clip(-0.05, 0.05)   # new
+        df["trend_consistency"]  = trend_consistency   # new
+        df["htf_alignment"]      = (
+            (trend_15m == trend_1h) & (trend_1h == trend_4h)
+        ).astype(int) * trend_1h   # +1, -1, or 0
+
+        return df
+    except Exception:
+        for col in ["trend_15m", "trend_1h", "trend_4h",
+                    "htf_momentum", "trend_consistency", "htf_alignment"]:
+            df[col] = 0
+        return df
+
+
+def add_macro_context(
+    df:  pd.DataFrame,
+    vix: pd.Series = None,
+    dxy: pd.Series = None,
+) -> pd.DataFrame:
+    """
+    Add VIX and DXY macro context features.
+    Both are daily series reindexed and forward-filled to match df's index.
+    """
+    if vix is not None:
+        v = vix.reindex(df.index, method="ffill")
+        df["vix_level"]   = v
+        df["vix_z"]       = (
+            (v - v.rolling(20).mean()) /
+            (v.rolling(20).std() + 1e-9)
+        )
+        df["fear_regime"] = (v > 25).astype(int)
+    else:
+        df["vix_level"]   = 0.0
+        df["vix_z"]       = 0.0
+        df["fear_regime"] = 0
+
+    if dxy is not None:
+        d = dxy.reindex(df.index, method="ffill")
+        df["dxy_trend"] = (
+            (d > d.ewm(span=20).mean()).astype(int) * 2 - 1
+        )
+    else:
+        df["dxy_trend"] = 0.0
+
+    return df
+
+
 # ── Feature column registry ───────────────────────────────────
 
 FEATURE_COLS = [
-    # Trend
-    "ema_cross", "ema_50_200", "macd", "macd_hist", "macd_cross",
+    # HTF Context — our strongest signal (corr 0.10-0.21)
+    "trend_1h", "trend_15m", "trend_4h",
+    "htf_alignment", "htf_momentum", "trend_consistency",
+
+    # Trend (medium correlation 0.04-0.07)
     "adx", "plus_di", "minus_di", "di_diff",
-    # Momentum
-    "rsi_norm", "rsi_div", "stoch_k", "stoch_d", "stoch_cross",
-    "roc_1", "roc_3", "roc_6", "roc_12", "roc_24",
-    "williams_r", "cci",
-    # Volatility
-    "atr_pct", "atr_norm", "bb_width", "bb_pos", "bb_squeeze",
-    "rvol_5", "rvol_10", "rvol_20", "rvol_ratio", "hl_range",
-    # Candle
-    "body_ratio", "upper_wick", "lower_wick", "direction",
-    "close_pos", "gap", "bull_streak", "bear_streak", "is_doji",
-    # Volume
-    "vol_ratio", "vol_z", "obv_sig", "vwap_dist",
-    # Session
-    "hour_sin", "hour_cos", "dow_sin", "dow_cos",
-    "is_london", "is_ny", "is_overlap",
-    "is_monday", "is_friday",
+    "macd", "macd_hist",
+
+    # Momentum (medium correlation)
+    "rsi", "roc_6", "roc_1", "roc_12",
+    "williams_r", "stoch_k",
+
+    # Volatility (useful for sizing context)
+    "atr_norm", "bb_width", "bb_pos",
+    "atr_pct",   # new stationary version
+
+    # Price action (some correlation)
+    "body_ratio", "efficiency_ratio",
+    "close_pos", "range_pos",   # stationary versions
+
+    # Session/Time (corr 0.07-0.13)
+    "hour_sin", "hour_cos",
+    "london_open", "london_ny_overlap",
+    "is_friday", "is_monday",
+    "is_london",
+
+    # Returns — stationary
+    "ret_1", "ret_5", "ret_20",
+
+    # Macro context
+    "vix_z", "fear_regime", "dxy_trend",
+
+    # Normalised indicators
+    "rsi_norm",   # stationary RSI
+    "trend_align",  # categorical trend
+
+    # Volume (only for crypto where volume is real)
+    "vol_ratio",   # keep but will be 0 for forex — model handles this
 ]
 
 
 def build_features(
-    df:          pd.DataFrame,
-    add_labels:  bool = True,
-    horizon:     int  = FEATURE_HORIZON,
-    drop_na:     bool = True,
+    df:           pd.DataFrame,
+    add_labels:   bool = True,
+    drop_na:      bool = True,
+    vix:          pd.Series = None,
+    dxy:          pd.Series = None,
+    sl_mult:      float = 1.5,
+    tp_mult:      float = 2.0,
+    forward_bars: int   = 12,
+    swing:        bool  = False,
 ) -> pd.DataFrame:
     """
     Full feature pipeline. Returns enriched DataFrame.
@@ -254,6 +585,8 @@ def build_features(
     add_labels : add forward-return target column
     horizon    : bars ahead for label
     drop_na    : drop rows with NaN in feature columns
+    vix        : VIX daily series
+    dxy        : DXY daily series
     """
     if len(df) < MIN_BARS:
         logger.warning(f"Only {len(df)} bars — need {MIN_BARS} minimum")
@@ -266,22 +599,156 @@ def build_features(
     df = add_candle(df)
     df = add_session(df)
     df = add_volume(df)
+    df = add_microstructure(df)
+    df = add_stationary_features(df)
+    df = add_order_flow(df)
+    df = add_session_overlaps(df)
+    df = add_htf_context(df)
+    df = add_macro_context(df, vix=vix, dxy=dxy)
+
+    if swing:
+        df = add_swing_features(df)
 
     if add_labels:
-        df = add_target(df, horizon=horizon)
+        df = add_labels_col(df, forward_bars=forward_bars,
+                        sl_mult=sl_mult, tp_mult=tp_mult)
 
     if drop_na:
-        cols = FEATURE_COLS + (["target"] if add_labels else [])
+        active_cols = SWING_FEATURE_COLS if swing else FEATURE_COLS
+        cols = active_cols + (["label"] if add_labels else [])
         df   = df.dropna(subset=cols)
+
+
+    # Add at the end of build_features, before return df:
+
+    # ── Clip extreme feature values ───────────────────────────
+    # Prevents unbounded features from dominating the meta-learner
+    for col in FEATURE_COLS:
+        if col in df.columns:
+            # Clip to 5 standard deviations
+            mean = df[col].mean()
+            std  = df[col].std() + 1e-9
+            df[col] = df[col].clip(mean - 5*std, mean + 5*std)
 
     return df
 
 
-def get_X_y(df: pd.DataFrame) -> tuple:
-    """Return (X, y, df_feat) ready for sklearn/xgb."""
-    df_feat = build_features(df, add_labels=True)
+def get_X_y(
+    df:           pd.DataFrame,
+    sl_mult:      float = 1.5,
+    tp_mult:      float = 2.0,
+    forward_bars: int   = 12,
+    vix:          pd.Series = None,
+    dxy:          pd.Series = None,
+    swing:        bool  = False,
+) -> tuple:
+    """
+    Build feature matrix and labels.
+    - Removes class 0 (time barrier) — noise
+    - Balances classes using SMOTE
+    - Returns binary +1/-1 labels only
+    - swing=True adds multi-day features and uses SWING_FEATURE_COLS
+    """
+    df_feat = build_features(
+        df, add_labels=True,
+        sl_mult=sl_mult, tp_mult=tp_mult,
+        forward_bars=forward_bars,
+        vix=vix, dxy=dxy,
+        swing=swing,
+    )
     if df_feat.empty:
         return np.array([]), np.array([]), df_feat
-    X = df_feat[FEATURE_COLS].values
-    y = df_feat["target"].values
+
+    active_cols = SWING_FEATURE_COLS if swing else FEATURE_COLS
+    X = df_feat[active_cols].values
+    y = df_feat["label"].values
+
+    # ── Remove class 0 (time barrier — noise) ────────────────
+    mask = y != 0
+    X    = X[mask]
+    y    = y[mask]
+    df_feat = df_feat[mask]
+
+    if len(X) < 100:
+        return np.array([]), np.array([]), df_feat
+
+    # ── Balance classes using SMOTE ───────────────────────────
+    try:
+        from imblearn.over_sampling import SMOTE
+        smote = SMOTE(random_state=42, k_neighbors=min(5, len(X)//10))
+        X, y  = smote.fit_resample(X, y)
+    except ImportError:
+        classes, counts = np.unique(y, return_counts=True)
+        max_count       = counts.max()
+        X_list, y_list  = [X], [y]
+        for cls, count in zip(classes, counts):
+            if count < max_count:
+                idx        = np.where(y == cls)[0]
+                oversample = np.random.choice(idx, max_count - count)
+                X_list.append(X[oversample])
+                y_list.append(y[oversample])
+        X = np.vstack(X_list)
+        y = np.concatenate(y_list)
+    except Exception as e:
+        logger.warning(f"SMOTE failed — {e}, using imbalanced data")
+
     return X, y, df_feat
+
+
+# ================================================================
+# SWING-SPECIFIC FEATURES
+# ================================================================
+
+def add_swing_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Features specifically designed for 1h swing trading.
+    Focus on multi-day momentum and mean reversion signals.
+    """
+    c = df["close"]
+    h = df["high"]
+    l = df["low"]
+
+    # Multi-day returns
+    df["ret_5d"]  = c.pct_change(120).clip(-0.3, 0.3)
+    df["ret_10d"] = c.pct_change(240).clip(-0.5, 0.5)
+    df["ret_20d"] = c.pct_change(480).clip(-0.7, 0.7)
+
+    # Position in weekly/monthly range
+    weekly_high            = h.rolling(120).max()
+    weekly_low             = l.rolling(120).min()
+    df["weekly_range_pos"] = (c - weekly_low) / (weekly_high - weekly_low + 1e-9)
+
+    monthly_high            = h.rolling(480).max()
+    monthly_low             = l.rolling(480).min()
+    df["monthly_range_pos"] = (c - monthly_low) / (monthly_high - monthly_low + 1e-9)
+
+    # Multi-timeframe trend
+    ema_20h  = c.ewm(span=20).mean()
+    ema_120h = c.ewm(span=120).mean()
+    ema_480h = c.ewm(span=480).mean()
+
+    df["trend_1d"]  = (c > ema_20h).astype(int)  * 2 - 1
+    df["trend_1w"]  = (c > ema_120h).astype(int) * 2 - 1
+    df["trend_1m"]  = (c > ema_480h).astype(int) * 2 - 1
+    df["mtf_align"] = (df["trend_1d"] + df["trend_1w"] + df["trend_1m"]) / 3
+
+    # Volatility regime
+    atr_20          = (h - l).rolling(20).mean()
+    atr_120         = (h - l).rolling(120).mean()
+    df["vol_regime"] = (atr_20 / (atr_120 + 1e-9)).clip(0, 5)
+
+    return df
+
+
+# ================================================================
+# SWING FEATURE COLUMN REGISTRY
+# ================================================================
+
+SWING_FEATURE_COLS = FEATURE_COLS + [
+    "ret_5d", "ret_10d", "ret_20d",
+    "weekly_range_pos", "monthly_range_pos",
+    "trend_1d", "trend_1w", "trend_1m",
+    "mtf_align", "vol_regime",
+]
+
+

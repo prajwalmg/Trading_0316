@@ -18,7 +18,7 @@ from config.settings import (
     SLIPPAGE_BPS, COMMISSION_BPS, MAX_RISK_PCT,
     INITIAL_CAPITAL, GRANULARITY,
 )
-from signals.features import build_features, FEATURE_COLS
+from signals.features import build_features, FEATURE_COLS, SWING_FEATURE_COLS
 
 logger = logging.getLogger("trading_firm.backtest")
 
@@ -32,8 +32,22 @@ def compute_metrics(equity: pd.Series, trades: pd.DataFrame) -> dict:
     ret      = equity.pct_change().dropna()
     ann      = BARS_PER_YEAR.get(GRANULARITY, 105_120)
     tot_ret  = equity.iloc[-1] / equity.iloc[0] - 1
-    ann_ret  = (1 + tot_ret) ** (ann / max(len(equity), 1)) - 1
-    sharpe   = (ret.mean() / (ret.std() + 1e-9)) * np.sqrt(ann)
+    #ann_ret  = (1 + tot_ret) ** (ann / max(len(equity), 1)) - 1
+    #sharpe   = (ret.mean() / (ret.std() + 1e-9)) * np.sqrt(ann)
+    # Use actual calendar days instead of bar count for annualisation
+    if len(equity) > 1 and hasattr(equity.index, 'to_series'):
+        days = max((equity.index[-1] - equity.index[0]).days, 1)
+        years = days / 365.25
+    else:
+        years = max(len(equity) / ann, 1/365)
+
+    ann_ret = (1 + tot_ret) ** (1 / max(years, 0.01)) - 1
+    ann_ret = max(min(ann_ret, 10.0), -1.0)   # Cap at 1000% to prevent explosion
+
+    # Sharpe: annualise by sqrt of actual bars per year in the test window
+    actual_bpy = len(equity) / max(years, 0.01)
+    sharpe = (ret.mean() / (ret.std() + 1e-9)) * np.sqrt(min(actual_bpy, ann))
+
     neg_ret  = ret[ret < 0]
     sortino  = (ret.mean() / (neg_ret.std() + 1e-9)) * np.sqrt(ann) if len(neg_ret) > 1 else 0
     max_dd   = (equity / equity.cummax() - 1).min()
@@ -67,15 +81,26 @@ def run_backtest_single(
     model,
     capital:   float = INITIAL_CAPITAL,
     min_conf:  float = MIN_CONFIDENCE,
+    swing:     bool  = False,
 ) -> dict:
-    df_feat = build_features(df_raw, add_labels=False, drop_na=True)
+    df_feat = build_features(df_raw, add_labels=False, drop_na=True, swing=swing)
     if df_feat.empty:
         return {"metrics": {}, "equity": pd.Series(), "trades": pd.DataFrame()}
 
-    X        = df_feat[FEATURE_COLS].values
+    active_cols = SWING_FEATURE_COLS if swing else FEATURE_COLS
+    X           = df_feat[active_cols].values
     sigs, confs, _ = model.predict_with_confidence(X)
 
     cost_rate = (SLIPPAGE_BPS + COMMISSION_BPS) / 10_000
+
+    # Add realistic forex spread for intraday (1.5 pips)
+    # Only apply for forex — equities already have commission modelled
+    avg_price    = float(df_feat["close"].mean())
+    spread_pips  = 1.5
+    pip_size     = 0.0001 if avg_price < 10 else 0.01
+    spread_cost  = (spread_pips * pip_size) / avg_price
+    cost_rate    = cost_rate + spread_cost
+
 
     trades   = []
     equity   = [capital]

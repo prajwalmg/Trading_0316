@@ -12,9 +12,11 @@
 """
 
 import logging
+import importlib
 import time
 from datetime import datetime, timezone
 from typing import Optional
+import json
 
 import numpy as np
 import pandas as pd
@@ -29,6 +31,57 @@ from config.settings import (
 )
 
 logger = logging.getLogger("trading_firm.execution")
+
+
+def calibration_report(self) -> dict:
+    """
+    Check if model confidence matches actual win rate.
+    Run weekly to tune confidence thresholds.
+    
+    If 60-70% confidence bucket shows only 45% win rate
+    → raise threshold to 65%.
+    If 60-70% shows 70% win rate → lower threshold to 55%.
+    """
+    import glob
+
+    buckets = {
+        "55-60%": {"wins": 0, "total": 0},
+        "60-65%": {"wins": 0, "total": 0},
+        "65-70%": {"wins": 0, "total": 0},
+        "70-75%": {"wins": 0, "total": 0},
+        "75%+":   {"wins": 0, "total": 0},
+    }
+
+    for path in glob.glob("logs/feedback/*_outcomes.jsonl"):
+        with open(path) as f:
+            for line in f:
+                try:
+                    r    = json.loads(line)
+                    conf = r.get("confidence", 0)
+                    won  = r.get("won", False)
+
+                    if   conf < 0.60: bucket = "55-60%"
+                    elif conf < 0.65: bucket = "60-65%"
+                    elif conf < 0.70: bucket = "65-70%"
+                    elif conf < 0.75: bucket = "70-75%"
+                    else:             bucket = "75%+"
+
+                    buckets[bucket]["total"] += 1
+                    if won:
+                        buckets[bucket]["wins"] += 1
+                except Exception:
+                    continue
+
+    report = {}
+    for bucket, data in buckets.items():
+        if data["total"] >= 5:
+            wr = data["wins"] / data["total"]
+            report[bucket] = {
+                "win_rate": round(wr, 3),
+                "trades":   data["total"],
+                "verdict":  "✅ good" if wr >= 0.55 else "⚠️ weak" if wr >= 0.45 else "❌ bad",
+            }
+    return report
 
 
 # ── Base interface ────────────────────────────────────────────
@@ -78,6 +131,79 @@ class PaperBroker(BrokerBase):
         cost      = price * (total_bps / 10_000)
         return price + (direction * cost)
 
+    def partial_close(
+        self,
+        instrument:     str,
+        close_fraction: float = 0.5,
+        reason:         str   = "partial_tp",
+    ) -> dict:
+        if instrument not in self.positions:
+            return {"status": "no_position"}
+
+        pos         = self.positions[instrument]
+        total_units = abs(pos["units"])
+
+        # Use stored direction if available, else derive from units sign
+        direction   = pos.get("direction", 1 if pos["units"] > 0 else -1)
+
+        # Fractional-safe close units — no int() truncation
+        close_units = total_units * close_fraction
+        close_units = max(close_units, total_units * 0.01)  # minimum 1% of position
+
+        current_price = self._prices.get(instrument, pos["entry"])
+        pnl           = (current_price - pos["entry"]) * direction * close_units
+
+        # Reduce position — keep as float for crypto
+        remaining = (total_units - close_units) * direction
+        pos["units"] = remaining
+
+        trade = {
+            "instrument": instrument,
+            "direction":  "LONG" if direction == 1 else "SHORT",
+            "entry":      pos["entry"],
+            "exit":       current_price,
+            "units":      round(close_units, 6),
+            "pnl":        round(pnl, 2),
+            "reason":     reason,
+            "type":       "partial",
+        }
+        self.trades.append(trade)
+
+        if abs(pos["units"]) < total_units * 0.01:
+            del self.positions[instrument]
+
+        logger.info(
+            f"Partial close: {instrument} | "
+            f"{close_units:.6f} units @ {current_price:.5f} | "
+            f"P&L: {pnl:+.2f} | Remaining: {abs(pos.get('units', 0)):.6f} units"
+        )
+        return {
+            "status":          "partial_closed",
+            "pnl":             round(pnl, 2),
+            "remaining_units": abs(pos.get("units", 0)),
+        }
+
+
+    def update_stop_loss(self, instrument: str, new_sl: float) -> bool:
+        """Update the stop loss for an open position (for trailing stops)."""
+        if instrument not in self.positions:
+            return False
+        self.positions[instrument]["sl"] = new_sl
+        return True
+
+
+    def get_last_price(self, instrument: str) -> float:
+        """Return the last known price for an instrument."""
+        return self._prices.get(instrument, 0.0)
+
+
+    def get_bars_open(self, instrument: str, current_bar: int) -> int:
+        """Return how many bars a position has been open."""
+        if instrument not in self.positions:
+            return 0
+        open_bar = self.positions[instrument].get("open_bar", current_bar)
+        return current_bar - open_bar
+
     def update_price(self, instrument: str, price: float):
         """Feed latest price — called by live trading loop."""
         self._prices[instrument] = price
@@ -102,6 +228,38 @@ class PaperBroker(BrokerBase):
         if hit:
             self._close_position(instrument, hit[1], reason=hit[0])
 
+    def _log_trade_outcome(
+        self,
+        instrument: str,
+        pos:        dict,
+        exit_price: float,
+        pnl:        float,
+        reason:     str,
+    ):
+        """
+        Save every trade outcome with its features for feedback loop.
+        Used for confidence calibration and future retraining.
+        """
+        record = {
+            "instrument":  instrument,
+            "direction":   pos.get("direction", 0),
+            "entry":       round(pos.get("entry", 0), 6),
+            "exit":        round(exit_price, 6),
+            "pnl":         round(pnl, 4),
+            "won":         pnl > 0,
+            "reason":      reason,
+            "confidence":  round(pos.get("confidence", 0), 4),
+            "regime":      pos.get("regime", "unknown"),
+            "atr":         round(pos.get("atr", 0), 6),
+            "htf_trend":   pos.get("htf_trend", 0),
+            "timestamp":   datetime.now(timezone.utc).isoformat(),
+        }
+        os.makedirs("logs/feedback", exist_ok=True)
+        log_path = f"logs/feedback/{instrument}_outcomes.jsonl"
+        with open(log_path, "a") as f:
+            f.write(json.dumps(record) + "\n")
+
+
     def _close_position(self, instrument: str, exit_price: float, reason: str = "manual"):
         if instrument not in self.positions:
             return
@@ -111,6 +269,8 @@ class PaperBroker(BrokerBase):
         units  = pos["units"]
         dir_   = pos["direction"]
         pnl    = dir_ * (exit_price - entry) * units
+
+        self._log_trade_outcome(instrument, pos, exit_price, pnl, reason)
 
         self.capital += pnl
         self.trades.append({
@@ -214,17 +374,18 @@ class AlpacaBroker(BrokerBase):
 
     def __init__(self):
         try:
-            import alpaca_trade_api as tradeapi
-            self.api = tradeapi.REST(
-                ALPACA_API_KEY, ALPACA_SECRET, ALPACA_BASE_URL,
-                api_version="v2"
-            )
-            logger.info(f"AlpacaBroker connected | url={ALPACA_BASE_URL}")
-        except ImportError:
+            tradeapi = importlib.import_module("alpaca_trade_api")
+        except ImportError as exc:
             raise ImportError(
                 "alpaca-trade-api not installed. "
                 "Run: pip install alpaca-trade-api"
-            )
+            ) from exc
+
+        self.api = tradeapi.REST(
+            ALPACA_API_KEY, ALPACA_SECRET, ALPACA_BASE_URL,
+            api_version="v2"
+        )
+        logger.info(f"AlpacaBroker connected | url={ALPACA_BASE_URL}")
 
     def get_account(self) -> dict:
         acc = self.api.get_account()

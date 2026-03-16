@@ -9,34 +9,89 @@
 # ── ENVIRONMENT ──────────────────────────────────────────────
 ENV              = "paper"          # "paper" | "live"
 BASE_CURRENCY    = "USD"
-INITIAL_CAPITAL  = 10_000.0         # Works from €10 upward
+INITIAL_CAPITAL  = 1_000.0         # Works from €10 upward
 
 # ── ASSET UNIVERSE ───────────────────────────────────────────
 FOREX_PAIRS = [
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X",
-    "AUDUSD=X", "USDCAD=X", "USDCHF=X",
-    "NZDUSD=X", "EURGBP=X",
+    "EURUSD=X",
+    "GBPUSD=X",
+    "EURGBP=X",
+    "EURJPY=X",
+    "USDCHF=X",
+    "EURCHF=X",
 ]
 
 EQUITY_TICKERS = [
-    "AAPL", "MSFT", "GOOGL", "AMZN",
-    "NVDA", "META", "TSLA", "SPY",
+    "NVDA",
+    "AAPL",
+    "GS",
+    "TSLA",
+    "JPM",
+    "EWG",
+    "SAP",
 ]
 
 COMMODITY_TICKERS = [
-    "GC=F",    # Gold
-    "CL=F",    # Crude Oil WTI
-    "SI=F",    # Silver
-    "NG=F",    # Natural Gas
+    "GC=F",
+    "SI=F",
+    "NG=F",
+    "HG=F",
 ]
 
-ALL_INSTRUMENTS = FOREX_PAIRS + EQUITY_TICKERS + COMMODITY_TICKERS
+CRYPTO_TICKERS = [
+    "XRP-USD",
+    "BNB-USD",
+]
+
+ASSET_CLASS_MAP = {}
+for t in FOREX_PAIRS:
+    ASSET_CLASS_MAP[t] = "forex"
+for t in EQUITY_TICKERS:
+    ASSET_CLASS_MAP[t] = "equity"
+for t in COMMODITY_TICKERS:
+    ASSET_CLASS_MAP[t] = "commodity"
+for t in CRYPTO_TICKERS:
+    ASSET_CLASS_MAP[t] = "crypto"
+
+# Add after existing ASSET_CLASS_MAP loops:
+CRYPTO_SHORT_NAMES = {
+    "BTC": "crypto", "ETH": "crypto", "SOL": "crypto",
+    "BNB": "crypto", "ADA": "crypto", "XRP": "crypto",
+}
+ASSET_CLASS_MAP.update(CRYPTO_SHORT_NAMES)
+
+
+# Add crypto risk multipliers:
+ASSET_RISK_PCT = {
+    "forex":     0.005,
+    "equity":    0.015,
+    "commodity": 0.015,
+    "crypto":    0.002,   # 0.2% — reduced from 0.5% for safety
+}
+
+
+ASSET_ATR_MULTIPLIER = {
+    "forex":     2.5,
+    "equity":    2.0,
+    "commodity": 2.0,
+    "crypto":    5.0,       #3.5,
+}
+
+DATA_PERIODS = {
+    "forex":     "730d",
+    "equity":    "max",
+    "commodity": "max",
+    "crypto":    "730d",
+}
+
+
+ALL_INSTRUMENTS = FOREX_PAIRS + EQUITY_TICKERS + CRYPTO_TICKERS + COMMODITY_TICKERS
 
 # ── DATA ─────────────────────────────────────────────────────
-GRANULARITY      = "5m"             # yfinance: 1m,2m,5m,15m,30m,60m,1d
-LOOKBACK_PERIOD  = "60d"            # yfinance period for intraday
+GRANULARITY      = "1h"             # yfinance: 1m,2m,5m,15m,30m,60m,1d
+LOOKBACK_PERIOD  = "730d"            # yfinance period for intraday
 DAILY_PERIOD     = "2y"             # for daily-bar features
-MIN_BARS         = 200              # minimum bars needed to compute features
+MIN_BARS         = 50              # minimum bars needed to compute features
 DATA_CACHE_DIR   = "data/cache"
 
 # ── FEATURES ─────────────────────────────────────────────────
@@ -94,18 +149,30 @@ RF_PARAMS = {
     "n_jobs":       -1,
 }
 
+MLPC_PARAMS = {
+    "hidden_layer_sizes": (128, 64, 32),
+    "activation": "relu",
+    "max_iter": 500,
+    "early_stopping": True,
+    "validation_fraction": 0.1,
+    "random_state": 42,
+    "verbose": False,
+}
+
 # Minimum ensemble confidence to generate a signal
-MIN_CONFIDENCE   = 0.58
+MIN_CONFIDENCE   =  0.60        #0.58  #0.48
+MIN_BARS_BETWEEN_TRADES = 0
 
 # ── RISK MANAGEMENT ──────────────────────────────────────────
 # Scales automatically with account size (works from €10)
-MAX_RISK_PCT          = 0.01        # 1% account risk per trade
+MAX_RISK_PCT          = 0.03        # 3% account risk per trade
 MAX_DAILY_LOSS_PCT    = 0.03        # 3% daily loss → stop trading
 MAX_WEEKLY_LOSS_PCT   = 0.06        # 6% weekly loss → stop trading
 MAX_DRAWDOWN_PCT      = 0.10        # 10% drawdown → halt all trading
-MAX_OPEN_POSITIONS    = 5           # across all instruments
-MAX_CORRELATED_TRADES = 2           # max trades in same asset class at once
+MAX_OPEN_POSITIONS    = 20           # across all instruments
+MAX_CORRELATED_TRADES = 10           # max trades in same asset class at once
 MAX_SINGLE_EXPOSURE   = 0.20        # max 20% of capital in one instrument
+MAX_HOLD_BARS         = 24
 
 SL_ATR_MULT      = 1.5
 TP_ATR_MULT      = 2.5
@@ -113,7 +180,7 @@ TRAILING_STOP    = True
 TRAIL_ATR_MULT   = 1.0
 
 # Kelly criterion cap (never bet more than half-Kelly)
-KELLY_FRACTION   = 0.25
+KELLY_FRACTION   = 0.5
 
 # ── EXECUTION ────────────────────────────────────────────────
 BROKER           = "alpaca"         # "alpaca" | "oanda" | "paper"

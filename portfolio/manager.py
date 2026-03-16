@@ -28,7 +28,7 @@ import pandas as pd
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config.settings import (
-    STRATEGY_WEIGHTS, MIN_CONFIDENCE, REBALANCE_HOURS,
+    MIN_BARS_BETWEEN_TRADES, STRATEGY_WEIGHTS, MIN_CONFIDENCE, REBALANCE_HOURS,
     FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS,
 )
 from signals.regime import RegimeTracker, strategy_weights_by_regime
@@ -170,6 +170,7 @@ class PortfolioManager:
         self._weights       = dict(STRATEGY_WEIGHTS)
         self._last_rebalance = datetime.now(timezone.utc)
         self._signal_log    = []
+        self._last_trade    = {}  # ticker → last trade bar index
 
     # ── Signal aggregation ────────────────────────────────────
 
@@ -180,12 +181,6 @@ class PortfolioManager:
         ml_signal: int,
         ml_conf:   float,
     ) -> dict:
-        """
-        Collect signals from all 4 strategies.
-        Combine using current regime-adjusted weights.
-        Returns final signal dict.
-        """
-        # Update regime for this instrument
         self.regime_tracker.update(ticker, df)
         regime  = self.regime_tracker.current(ticker)
         weights = strategy_weights_by_regime(regime)
@@ -214,10 +209,28 @@ class PortfolioManager:
                 weighted_short += w * conf
             total_weight += w
 
-        # Determine final signal
         long_score  = weighted_long  / (total_weight + 1e-9)
         short_score = weighted_short / (total_weight + 1e-9)
 
+        # ── KEY FIX: ML override ──────────────────────────────
+        # If ML confidence is very high (>80%) and strategies are
+        # simply abstaining (not actively disagreeing), trust ML.
+        strategy_long  = sum(1 for s in sigs.values() if s["signal"] ==  1)
+        strategy_short = sum(1 for s in sigs.values() if s["signal"] == -1)
+
+        dominant = self.regime_tracker.dominant_regime()
+
+        if ml_conf >= 0.50 and ml_signal != 0:  
+            # Don't override if signal contradicts dominant regime
+            regime_allows_long  = dominant != "trending_down"
+            regime_allows_short = dominant != "trending_up"
+
+            if ml_signal == 1 and strategy_short == 0 and regime_allows_long:
+                long_score  = max(long_score,  ml_conf * 0.85)
+            if ml_signal == -1 and strategy_long == 0 and regime_allows_short:
+                short_score = max(short_score, ml_conf * 0.85)
+
+        # Determine final signal
         if long_score > short_score and long_score >= MIN_CONFIDENCE:
             final_signal = 1
             final_conf   = long_score
@@ -243,6 +256,7 @@ class PortfolioManager:
         self._signal_log.append(result)
         return result
 
+    
     # ── Execution decision ────────────────────────────────────
 
     def should_execute(
@@ -260,7 +274,16 @@ class PortfolioManager:
         regime  = signal_dict["regime"]
 
         if signal == 0:
-            return False, "No signal", {}
+            return False, "Strategies disagree", {}
+        
+        # Add at the top of should_execute, after signal == 0 check:
+        # Check cooldown
+        """
+        last_trade_bar = self._last_trade.get(ticker, 0)
+        current_bar    = len(df)
+        if current_bar - last_trade_bar < MIN_BARS_BETWEEN_TRADES:
+            return False, f"Cooldown: {current_bar - last_trade_bar} bars since last trade", {}
+        """
 
         try:
             atr      = float(df["atr"].iloc[-1])     if "atr"      in df.columns else 0.001
@@ -300,6 +323,13 @@ class PortfolioManager:
         sizing["tp"] = tp
         sizing["entry"] = close
         sizing["direction"] = signal
+
+        # Correlation-adjusted sizing
+        open_pos       = self.broker.get_open_positions()
+        adjusted_units = self.risk.correlation_adjusted_size(
+            ticker, sizing["units"], open_pos
+        )
+        sizing["units"] = adjusted_units
 
         return True, "OK", sizing
 

@@ -1,111 +1,42 @@
-# TradingFirm OS — Professional Algorithmic Trading System
+# Trading Firm OS
 
-A full institutional-grade trading system for Forex, Equities, and
-Commodities. Scales from €10 to €10M+ without changing core logic.
-
----
+A professional multi-asset ML trading system for Forex, Equities, Commodities and Crypto.
 
 ## Architecture
 
-```
 trading_firm/
-├── config/settings.py          # All parameters — edit this first
-├── main.py                     # Entry point (4 modes)
-│
-├── data/pipeline.py            # Multi-source data fetcher + cache
-│
-├── signals/
-│   ├── features.py             # 40+ features (trend/momentum/vol/candle/volume/session)
-│   ├── regime.py               # Market regime detection (4 regimes)
-│   └── ensemble.py             # Stacked ensemble (XGB + LGBM + RF → LogReg)
-│
-├── risk/engine.py              # 7-layer risk management + Kelly sizing
-│
-├── execution/broker.py         # Paper / Alpaca / OANDA broker layer
-│
-├── portfolio/manager.py        # 4-strategy orchestrator + conflict resolution
-│
-├── backtest/engine.py          # Vectorised backtest + full metrics
-│
-└── dashboard/cli.py            # Real-time terminal dashboard
-```
+├── config/settings.py          # all configuration
+├── data/pipeline.py            # yfinance data fetching
+├── signals/features.py         # 52 features (42 base + 10 swing)
+├── signals/ensemble.py         # XGB+LGBM+RF+MLP stacked ensemble
+├── signals/regime.py           # HTF regime detection
+├── risk/engine.py              # position sizing, drawdown halting
+├── execution/broker.py         # paper broker, trade logging
+├── portfolio/manager.py        # signal aggregation
+├── backtest/engine.py          # walk-forward backtesting
+├── dashboard/cli.py            # terminal dashboard
+├── utils/logger.py             # logging
+├── utils/scheduler.py          # weekly retraining scheduler
+├── main.py                     # swing system (1h bars)
+└── intraday_forex.py           # intraday system (5m bars)
+## Setup
 
----
-
-## Quick Start
-
-### 1. Install Python 3.11 via pyenv
 ```bash
-brew install pyenv
-pyenv install 3.11.9
-pyenv local 3.11.9
+git clone <repo-url>
+cd trading_firm
 python -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
-```
+# Intraday system (BTC/ETH/SOL — 5min bars)
+python intraday_forex.py --mode train
+python intraday_forex.py --mode backtest
+python intraday_forex.py --mode paper --poll 300
 
-### 2. Configure
-Edit `config/settings.py`:
-- Set `INITIAL_CAPITAL` (works from €10)
-- Add broker credentials if using live/paper API
-- Adjust `FOREX_PAIRS`, `EQUITY_TICKERS`, `COMMODITY_TICKERS`
-
-### 3. Train models
-```bash
+# Swing system (GC=F/XRP-USD/BNB-USD — 1h bars)
 python main.py --mode train
-```
-
-### 4. Backtest
-```bash
 python main.py --mode backtest
-```
+python main.py --mode paper --poll 3600
 
-### 5. Paper trade (no real money)
-```bash
-python main.py --mode paper
-```
-
----
-
-## Strategies
-
-| Strategy | Logic | Best Regime |
-|---|---|---|
-| Momentum | Follows ML signal when ADX strong + MACD confirms | Trending |
-| Mean Reversion | Fades RSI + Bollinger extremes | Ranging |
-| Breakout | Enters on BB squeeze breakouts with volume | Any |
-| Regime Adaptive | Scales ML signal by regime confidence | All |
-
----
-
-## Risk Rules
-
-1. **1% max risk per trade** (scales with account size automatically)
-2. **Quarter-Kelly sizing** (mathematically optimal, conservative)
-3. **3% daily loss → halt** trading until next day
-4. **6% weekly loss → halt** trading until next week
-5. **10% drawdown → full halt** + human review required
-6. **Max 5 open positions** at any time
-7. **Max 2 correlated positions** per asset class
-8. **Volatility spike filter** (ATR > 2.5× mean → skip)
-9. **ATR-based trailing stops** (adjusts to volatility automatically)
-
----
-
-## Supported Brokers
-
-| Broker | Asset Classes | Setup |
-|---|---|---|
-| Paper (built-in) | All | No API key needed |
-| Alpaca | Stocks + Crypto | Free API key at alpaca.markets |
-| OANDA | Forex | Free practice account at oanda.com |
-
----
-
-## Important Warnings
-
-- Always paper trade for at least 1–3 months before going live
-- Past performance does not guarantee future results
-- Forex, equities, and commodity trading involves significant risk
-- This system is for educational and research purposes
-- Retrain models monthly as market regimes shift
+# Scheduler (weekly retraining)
+python utils/scheduler.py intraday
+python utils/scheduler.py swing

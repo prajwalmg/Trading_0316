@@ -12,6 +12,7 @@
 import os
 import hashlib
 import logging
+import time
 import warnings
 from datetime import datetime, timedelta
 from typing import Optional
@@ -25,9 +26,9 @@ warnings.filterwarnings("ignore")
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config.settings import (
-    GRANULARITY, LOOKBACK_PERIOD, DAILY_PERIOD,
+    ASSET_CLASS_MAP, GRANULARITY, LOOKBACK_PERIOD, DAILY_PERIOD,
     MIN_BARS, DATA_CACHE_DIR,
-    FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS,
+    FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS, CRYPTO_TICKERS,
 )
 
 logger = logging.getLogger("trading_firm.data")
@@ -37,7 +38,7 @@ ASSET_CLASS = {}
 for t in FOREX_PAIRS:       ASSET_CLASS[t] = "forex"
 for t in EQUITY_TICKERS:    ASSET_CLASS[t] = "equity"
 for t in COMMODITY_TICKERS: ASSET_CLASS[t] = "commodity"
-
+for t in CRYPTO_TICKERS:    ASSET_CLASS[t] = "crypto"
 
 # ── Cache helpers ─────────────────────────────────────────────
 
@@ -48,7 +49,7 @@ def _cache_path(ticker: str, interval: str, period: str) -> str:
     return os.path.join(DATA_CACHE_DIR, f"{name}_{interval}_{key}.parquet")
 
 
-def _cache_valid(path: str, max_age_minutes: int = 15) -> bool:
+def _cache_valid(path: str, max_age_minutes: int = 90) -> bool:
     if not os.path.exists(path):
         return False
     age = datetime.now().timestamp() - os.path.getmtime(path)
@@ -124,13 +125,41 @@ def fetch_yfinance(
         return df
 
     try:
-        raw = yf.download(ticker, interval=interval, period=period,
+        import time as _time
+        raw = pd.DataFrame()
+        for attempt in range(3):
+            try:
+                raw = yf.download(ticker, interval=interval, period=period,
                           progress=False, auto_adjust=True, multi_level_index=False)
+                if not raw.empty:
+                    break
+                _time.sleep(2 ** attempt)   # 1s, 2s, 4s backoff
+            except Exception as _e:
+                logger.warning(f"{ticker}: attempt {attempt+1} failed — {_e}")
+                _time.sleep(2 ** attempt)
         if raw.empty:
             raise ValueError(f"No data returned for {ticker}")
 
-        raw.columns = [c.lower() for c in raw.columns]
-        df = raw[["open", "high", "low", "close", "volume"]].copy()
+        #raw.columns = [c.lower() for c in raw.columns]
+        #df = raw[["open", "high", "low", "close", "volume"]].copy()
+        
+        # Flatten MultiIndex if present, then lowercase
+        if hasattr(raw.columns, "levels"):
+            raw.columns = raw.columns.get_level_values(0)
+        raw.columns = [str(c).lower().strip() for c in raw.columns]
+
+        # Rename any variant column names
+        raw = raw.rename(columns={
+            "adj close": "close",
+            "adjclose":  "close",
+        })
+        df = raw[[c for c in ["open", "high", "low", "close", "volume"] if c in raw.columns]].copy()
+
+        # Add volume column with zeros if missing (forex has no volume)
+        if "volume" not in df.columns:
+            df["volume"] = 0
+
+        
         df.index.name = "time"
         df.index = pd.to_datetime(df.index)
 
@@ -153,6 +182,95 @@ def fetch_yfinance(
             logger.warning(f"{ticker}: falling back to stale cache")
             return pd.read_parquet(cache)
         return pd.DataFrame()
+
+def fetch_macro_context(use_cache: bool = True) -> dict:
+    """
+    Fetch VIX and DXY daily bars.
+    Returns dict with keys 'vix' and 'dxy' as pd.Series of close prices.
+    """
+    macro = {}
+    tickers = {"vix": "^VIX", "dxy": "DX-Y.NYB"}
+    
+    for name, ticker in tickers.items():
+        try:
+            df = fetch_yfinance(
+                ticker, interval="1d", period="730d",
+                use_cache=use_cache
+            )
+            if not df.empty:
+                macro[name] = df["close"]
+                logger.info(f"Macro {name}: {len(df)} daily bars loaded")
+            else:
+                macro[name] = None
+                logger.warning(f"Macro {name}: no data returned")
+        except Exception as e:
+            macro[name] = None
+            logger.warning(f"Macro {name}: fetch failed — {e}")
+    
+    return macro
+
+def update_intraday_cache(pair: str, yf_ticker: str, is_crypto: bool = False) -> pd.DataFrame:
+    """
+    Fetch latest 5-min bars and append to local parquet cache.
+    Run daily to build up history beyond yfinance's 60-day limit.
+    Call this at the start of each paper trading cycle.
+    """
+    cache_path = f"data/cache/intraday/{pair}_5min.parquet"
+    os.makedirs("data/cache/intraday", exist_ok=True)
+
+    # Load existing cache
+    if os.path.exists(cache_path):
+        existing  = pd.read_parquet(cache_path)
+        last_date = existing.index[-1]
+        logger.info(f"{pair}: cache loaded — {len(existing)} bars, last={last_date.date()}")
+    else:
+        existing  = pd.DataFrame()
+        last_date = None
+
+    # Fetch latest 7 days from yfinance
+    for attempt in range(3):
+        try:
+            df_new = yf.download(
+                yf_ticker, interval="5m", period="7d",
+                progress=False, multi_level_index=False
+            )
+            if not df_new.empty:
+                break
+        except Exception as e:
+            logger.warning(f"{pair}: cache update attempt {attempt+1} failed — {e}")
+            time.sleep(2 ** attempt)
+    else:
+        logger.warning(f"{pair}: cache update failed — using existing cache")
+        return existing if not existing.empty else pd.DataFrame()
+
+    df_new.columns = [c.lower() for c in df_new.columns]
+    df_new.index   = df_new.index.tz_localize(None)
+
+    # Session filter for forex
+    if not is_crypto:
+        df_new = df_new[
+            (df_new.index.weekday < 5) &
+            (df_new.index.hour >= 7)   &
+            (df_new.index.hour < 21)
+        ]
+
+    # Append only new bars
+    if last_date is not None:
+        df_new = df_new[df_new.index > last_date]
+
+    if df_new.empty:
+        logger.info(f"{pair}: cache already up to date")
+        return existing
+
+    combined = pd.concat([existing, df_new])
+    combined = combined[~combined.index.duplicated(keep="last")]
+    combined.to_parquet(cache_path)
+
+    logger.info(
+        f"{pair}: cache updated — added {len(df_new)} bars | "
+        f"total={len(combined)} | now → {combined.index[-1].date()}"
+    )
+    return combined
 
 
 # ── Secondary fetcher: Histdata CSV ──────────────────────────
@@ -234,16 +352,21 @@ class DataPipeline:
         tickers:  list = None,
         interval: str  = GRANULARITY,
         period:   str  = LOOKBACK_PERIOD,
+        use_cache: bool = True,
     ) -> dict:
         """
         Fetch/refresh data for all (or given) tickers.
         Returns dict of {ticker: DataFrame}.
         """
-        tickers = tickers or (FOREX_PAIRS + EQUITY_TICKERS + COMMODITY_TICKERS)
+        tickers = tickers or (FOREX_PAIRS + EQUITY_TICKERS + COMMODITY_TICKERS + CRYPTO_TICKERS)
         failed  = []
 
         for ticker in tickers:
-            df = fetch_yfinance(ticker, interval=interval, period=period)
+            from config.settings import DATA_PERIODS, ASSET_CLASS_MAP
+            asset_class  = ASSET_CLASS_MAP.get(ticker, "equity")
+            data_period  = DATA_PERIODS.get(asset_class, period)
+            df = fetch_yfinance(ticker, interval=interval, period=data_period, use_cache=use_cache)
+
             if df.empty:
                 failed.append(ticker)
                 logger.warning(f"No data for {ticker} — skipping")

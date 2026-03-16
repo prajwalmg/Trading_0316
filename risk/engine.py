@@ -30,7 +30,7 @@ from config.settings import (
     MAX_SINGLE_EXPOSURE, SL_ATR_MULT, TP_ATR_MULT,
     TRAILING_STOP, TRAIL_ATR_MULT, KELLY_FRACTION,
     MIN_CONFIDENCE, INITIAL_CAPITAL,
-    FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS,
+    FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS, CRYPTO_TICKERS
 )
 from signals.regime import regime_position_scale
 
@@ -41,6 +41,7 @@ ASSET_CLASS_MAP = {}
 for t in FOREX_PAIRS:       ASSET_CLASS_MAP[t] = "forex"
 for t in EQUITY_TICKERS:    ASSET_CLASS_MAP[t] = "equity"
 for t in COMMODITY_TICKERS: ASSET_CLASS_MAP[t] = "commodity"
+for t in CRYPTO_TICKERS:    ASSET_CLASS_MAP[t] = "crypto"
 
 
 class RiskEngine:
@@ -83,6 +84,41 @@ class RiskEngine:
             f"max_risk={MAX_RISK_PCT:.1%}/trade | "
             f"daily_limit={MAX_DAILY_LOSS_PCT:.1%}"
         )
+        
+    def update_trailing_stop(self, position: dict, current_price: float) -> float:
+        from config.settings import ASSET_CLASS_MAP, ASSET_ATR_MULTIPLIER
+        direction   = position.get("direction", 1)
+        current_sl  = position.get("sl", 0)
+        atr         = position.get("atr", current_price * 0.001)
+        instrument  = position.get("instrument", "")
+
+        asset_class = (
+            ASSET_CLASS_MAP.get(instrument) or
+            ASSET_CLASS_MAP.get(f"{instrument}-USD") or
+            "equity"
+        )
+        trail_mult = ASSET_ATR_MULTIPLIER.get(asset_class, 1.5)
+
+        if direction == 1:
+            new_sl = current_price - (trail_mult * atr)
+            return max(new_sl, current_sl)
+        else:
+            new_sl = current_price + (trail_mult * atr)
+            return min(new_sl, current_sl)
+
+
+
+    def portfolio_momentum_score(self, signals: dict) -> float:
+        """
+        Returns score -1.0 to +1.0 indicating overall market direction.
+        +1.0 = all instruments bullish, -1.0 = all bearish.
+        Use this to scale position sizes portfolio-wide.
+        """
+        long_count  = sum(1 for s in signals.values() if s.get("signal") ==  1)
+        short_count = sum(1 for s in signals.values() if s.get("signal") == -1)
+        total       = max(len(signals), 1)
+        return (long_count - short_count) / total
+
 
     # ── Daily / weekly reset ──────────────────────────────────
 
@@ -153,55 +189,117 @@ class RiskEngine:
         instrument: str,
         entry:      float,
         atr:        float,
+        confidence: float,
         regime:     str = "ranging",
-        confidence: float = 0.6,
     ) -> dict:
         """
-        Compute position size using fixed-fractional + Kelly + regime scaling.
-
-        Returns dict with:
-          units         : number of units to trade
-          risk_amount   : dollar amount at risk
-          stop_distance : distance to stop loss in price terms
-          sl            : stop loss price (set later by caller)
-          tp            : take profit price (set later by caller)
+        Calculate position size using:
+        - Base risk from MAX_RISK_PCT
+        - Regime multiplier (trend = bigger, ranging = smaller)
+        - Confidence multiplier (higher confidence = bigger)
+        - Kelly fraction
+        - Portfolio momentum boost
         """
-        # Base risk from Kelly (or fixed fractional)
-        base_risk_pct   = min(self.kelly_fraction(), MAX_RISK_PCT)
+        from config.settings import MAX_RISK_PCT, KELLY_FRACTION
 
-        # Confidence scaling: reduce size for lower confidence signals
-        conf_scale      = min(1.0, (confidence - 0.50) / 0.30)  # 0 at 50%, 1 at 80%+
-        conf_scale      = max(0.3, conf_scale)
+        from config.settings import ASSET_RISK_PCT, ASSET_CLASS_MAP, ASSET_ATR_MULTIPLIER
+        asset_class = ASSET_CLASS_MAP.get(instrument) or \
+              ASSET_CLASS_MAP.get(f"{instrument}-USD") or \
+              ASSET_CLASS_MAP.get(f"{instrument}=X") or \
+              "equity"
+        risk_pct    = ASSET_RISK_PCT.get(asset_class, MAX_RISK_PCT)
+        base_risk   = self.nav * risk_pct
 
-        # Regime scaling
-        regime_scale    = regime_position_scale(regime)
+        # ── Progressive drawdown size reduction ──────────────────
+        dd = (self.peak_nav - self.nav) / self.peak_nav if self.peak_nav > 0 else 0
+        if dd >= 0.08:
+            return {"units": 0, "risk_amount": 0, "regime_mult": 0,
+                    "conf_mult": 0, "stop_distance": 0}
+        elif dd >= 0.06: dd_factor = 0.25
+        elif dd >= 0.04: dd_factor = 0.50
+        elif dd >= 0.02: dd_factor = 0.75
+        else:            dd_factor = 1.00
 
-        # Final risk percentage
-        risk_pct        = base_risk_pct * conf_scale * regime_scale
-        risk_amount     = self.nav * risk_pct
+        base_risk *= dd_factor
 
-        # Stop distance in price units
-        stop_distance   = atr * SL_ATR_MULT
-        if stop_distance <= 0:
-            stop_distance = entry * 0.001
+        # ── Regime multiplier ─────────────────────────────────────
+        regime_mult = {
+            "trending_up":     1.5,
+            "trending_down":   1.5,
+            "ranging":         0.7,
+            "high_volatility": 0.5,
+        }.get(regime, 1.0)
 
-        # Units = risk / stop_distance (simplified for all instruments)
-        units           = int(risk_amount / stop_distance)
-        units           = max(1, units)
+        # ── Confidence multiplier (scales 0.5x → 1.5x) ───────────
+        conf_mult = 0.5 + float(confidence)   # 0.5 at 0%, 1.5 at 100%
+        conf_mult = max(0.5, min(conf_mult, 1.5))
 
-        # Single instrument exposure cap
-        max_exposure    = self.nav * MAX_SINGLE_EXPOSURE
-        max_units       = int(max_exposure / (entry + 1e-9))
-        units           = min(units, max_units)
+        # ── Kelly fraction ────────────────────────────────────────
+        risk = base_risk * regime_mult * conf_mult * KELLY_FRACTION
+
+        # ── Hard cap at 3x base risk ──────────────────────────────
+        risk = min(risk, base_risk * 3.0)
+        risk = max(risk, 1.0)   # minimum $1 risk
+
+        # ── Units from ATR-based stop distance ───────────────────
+        atr_mult  = ASSET_ATR_MULTIPLIER.get(asset_class, 1.5)
+        stop_dist = max(atr * atr_mult, entry * 0.001)   # at least 0.1% of price
+        units     = risk / stop_dist
+        
+        # ── Asset-aware position sizing ───────────────────────────
+        MAX_NOTIONAL_PCT = {
+            "forex":     0.15,
+            "equity":    0.25,
+            "commodity": 0.15,
+            "crypto":    0.10,
+        }
+        max_notional = self.nav * MAX_NOTIONAL_PCT.get(asset_class, 0.20)
+        max_units    = max_notional / entry
+
+        units = min(units, max_units)
+
+        # Crypto with high price — allow fractional units
+        if asset_class == "crypto" and entry > 100:
+            units = round(max(0.0001, units), 4)
+        else:
+            units = max(1, int(units))      
 
         return {
-            "units":          units,
-            "risk_amount":    round(risk_amount, 2),
-            "risk_pct":       round(risk_pct, 4),
-            "stop_distance":  round(stop_distance, 5),
-            "conf_scale":     round(conf_scale, 3),
-            "regime_scale":   round(regime_scale, 3),
+            "units":         units,
+            "risk_amount":   round(risk, 2),
+            "regime_mult":   regime_mult,
+            "conf_mult":     round(conf_mult, 3),
+            "stop_distance": round(stop_dist, 5),
         }
+    
+    def correlation_adjusted_size(
+        self,
+        instrument:     str,
+        base_units:     int,
+        open_positions: list,
+    ) -> int:
+        """
+        Reduce position size if correlated instruments already open.
+        Each same-class position already open reduces size by 20%.
+        """
+        from config.settings import ASSET_CLASS_MAP
+        asset_class = ASSET_CLASS_MAP.get(instrument) or \
+              ASSET_CLASS_MAP.get(f"{instrument}-USD") or \
+              ASSET_CLASS_MAP.get(f"{instrument}=X") or \
+              "equity"
+        same_class_count = sum(
+            1 for p in open_positions
+            if ASSET_CLASS_MAP.get(p.get("instrument", ""), "") == asset_class
+        )
+        reduction = 0.8 ** same_class_count
+        adjusted  = max(1, int(base_units * reduction))
+        if adjusted != base_units:
+            logger.debug(
+                f"{instrument}: size reduced {base_units}→{adjusted} "
+                f"({same_class_count} correlated positions open)"
+            )
+        return adjusted
+
 
     def sl_tp(
         self,
@@ -214,8 +312,31 @@ class RiskEngine:
         Compute ATR-based stop loss and take profit prices.
         Returns (sl_price, tp_price).
         """
-        sl_dist = atr * SL_ATR_MULT
-        tp_dist = atr * TP_ATR_MULT
+        from config.settings import ASSET_CLASS_MAP
+
+        asset_class = (
+            ASSET_CLASS_MAP.get(instrument) or
+            ASSET_CLASS_MAP.get(f"{instrument}-USD") or
+            ASSET_CLASS_MAP.get(f"{instrument}=X") or
+            "equity"
+        )
+
+        SL_MULT = {
+            "forex":     1.5,
+            "equity":    2.0,
+            "commodity": 2.0,
+            "crypto":    3.0,
+        }
+        TP_MULT = {
+            "forex":     2.0,
+            "equity":    3.0,
+            "commodity": 3.0,
+            "crypto":    4.0,
+        }
+
+        sl_dist = atr * SL_MULT.get(asset_class, SL_ATR_MULT)
+        tp_dist = atr * TP_MULT.get(asset_class, TP_ATR_MULT)
+
 
         if direction == 1:
             sl = round(entry - sl_dist, 5)
@@ -331,6 +452,8 @@ class RiskEngine:
         asset_class = ASSET_CLASS_MAP.get(instrument, "equity")
         if asset_class == "forex" and hour_utc not in range(7, 21):
             return False, f"Outside forex trading hours (UTC {hour_utc})"
+        if asset_class == "crypto":
+            pass
 
         return True, "OK"
 
