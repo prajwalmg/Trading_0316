@@ -562,6 +562,9 @@ FEATURE_COLS = [
 
     # Volume (only for crypto where volume is real)
     "vol_ratio",   # keep but will be 0 for forex — model handles this
+
+    # Alternative sentiment
+    "fg_norm", "fg_contrarian",
 ]
 
 
@@ -571,6 +574,8 @@ def build_features(
     drop_na:      bool = True,
     vix:          pd.Series = None,
     dxy:          pd.Series = None,
+    fg_norm:      float = None,
+    fg_contrarian: float = None,
     sl_mult:      float = 1.5,
     tp_mult:      float = 2.0,
     forward_bars: int   = 12,
@@ -605,6 +610,12 @@ def build_features(
     df = add_session_overlaps(df)
     df = add_htf_context(df)
     df = add_macro_context(df, vix=vix, dxy=dxy)
+
+    # ── Alternative data: Fear & Greed ───────────────────────
+    # If caller supplies live scalars, broadcast them as constant columns.
+    # During backtesting these default to 0 (neutral) — no lookahead.
+    df["fg_norm"]      = float(fg_norm)      if fg_norm      is not None else 0.0
+    df["fg_contrarian"] = float(fg_contrarian) if fg_contrarian is not None else 0.0
 
     if swing:
         df = add_swing_features(df)

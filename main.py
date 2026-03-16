@@ -55,15 +55,15 @@ from portfolio.manager import PortfolioManager
 from dashboard.cli     import Dashboard
 
 def get_label_params(ticker: str) -> dict:
-    """Return asset-class specific label parameters."""
+    """Return asset-class specific label parameters for DAILY bars."""
     from config.settings import ASSET_CLASS_MAP
     asset_class = ASSET_CLASS_MAP.get(ticker, "equity")
     return {
-        "forex":     {"sl_mult": 1.5, "tp_mult": 2.0, "forward_bars": 24},
-        "equity":    {"sl_mult": 2.0, "tp_mult": 3.0, "forward_bars": 48},
-        "commodity": {"sl_mult": 1.5, "tp_mult": 2.5, "forward_bars": 36},
-        "crypto":    {"sl_mult": 2.0, "tp_mult": 3.0, "forward_bars": 48},
-    }.get(asset_class, {"sl_mult": 1.5, "tp_mult": 2.0, "forward_bars": 24})
+        "forex":     {"sl_mult": 1.5, "tp_mult": 2.0, "forward_bars": 5},
+        "equity":    {"sl_mult": 2.0, "tp_mult": 3.0, "forward_bars": 10},
+        "commodity": {"sl_mult": 1.5, "tp_mult": 2.5, "forward_bars": 7},
+        "crypto":    {"sl_mult": 2.0, "tp_mult": 3.0, "forward_bars": 7},
+    }.get(asset_class, {"sl_mult": 1.5, "tp_mult": 2.0, "forward_bars": 5})
 
 
 # ══════════════════════════════════════════════════════════════
@@ -76,7 +76,11 @@ def run_train(instruments: list, capital: float):
     logger.info("=" * 60)
 
     pipeline = DataPipeline()
-    pipeline.refresh_all(tickers=instruments)
+    pipeline.refresh_all(
+        tickers=instruments,
+        interval="1d",
+        days=1825,   # 5 years of daily bars for training
+    )
 
     trained = []
     for ticker in instruments:
@@ -251,6 +255,10 @@ def run_paper(instruments: list, capital: float, poll_seconds: int = 60):
     logger.info("Initialising PortfolioManager...")
     portfolio = PortfolioManager(risk)
 
+    # Log upcoming high-impact economic events
+    from data.calendar import log_upcoming_events
+    log_upcoming_events()
+
     # Load or train models
     models = {}
     for ticker in instruments:
@@ -326,8 +334,20 @@ def run_paper(instruments: list, capital: float, poll_seconds: int = 60):
                 if isinstance(broker, PaperBroker) and latest_price > 0:
                     broker.update_price(ticker, latest_price)
 
+                # ── Fear & Greed sentiment ────────────────────────────────
+                from data.alternative import get_fear_greed
+                from config.settings import ASSET_CLASS_MAP
+                _ac  = ASSET_CLASS_MAP.get(ticker, "equity")
+                _fg  = get_fear_greed("crypto" if _ac == "crypto" else "market")
+
                 # Build features + get ML signal
-                df_feat = build_features(df_raw, add_labels=False, drop_na=True)
+                df_feat = build_features(
+                    df_raw,
+                    add_labels=False,
+                    drop_na=True,
+                    fg_norm=_fg["fg_norm"],
+                    fg_contrarian=_fg["fg_contrarian"],
+                )
                 if df_feat.empty:
                     continue
 
@@ -340,6 +360,13 @@ def run_paper(instruments: list, capital: float, poll_seconds: int = 60):
                     f"conf={ml_conf:.2%} | "
                     f"tradeable={sig_dict['tradeable']}"
                 )
+
+                # ── News blackout filter ──────────────────────────────────
+                from data.calendar import is_news_blackout
+                in_blackout, blackout_reason = is_news_blackout(ticker)
+                if in_blackout:
+                    logger.info(f"{ticker}: {blackout_reason} — skipping")
+                    continue
 
                 if not sig_dict["tradeable"]:
                     continue

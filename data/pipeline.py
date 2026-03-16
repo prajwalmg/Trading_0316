@@ -1,512 +1,486 @@
 """
 ================================================================
-  data/pipeline.py
-  Multi-source data pipeline with asset-class routing:
+  data/pipeline.py  — FULL UNIVERSE EDITION
+  Complete coverage across all asset classes
 
-  Routing priority (best → fallback):
-    Forex      →  OANDA v20 API   →  yfinance
-    Equity     →  Alpaca Data API →  yfinance
-    Crypto     →  Binance API     →  yfinance
-    Commodity  →  yfinance        (no free alternative)
-    Macro      →  FRED API        →  yfinance (^VIX, DX-Y.NYB)
+  Forex       : 46 pairs  (majors + minors + select exotics)
+  Crypto      :  8 pairs  (top liquid coins, free on IBKR)
+  Equities    : 12 tickers (US + EU, yfinance fallback)
+  Commodities :  6 instruments
 
-  All sources share the same parquet cache so switching sources
-  does not re-download data unnecessarily.
+  Data source logic:
+    IBKR Gateway (live)  →  primary for ALL assets
+    yfinance             →  fallback + long training history
+    Local parquet cache  →  offline & rate-limit protection
 
-  Secondary: Histdata CSV loader (Forex M1 backup)
+  IBKR pacing rules respected:
+    0.5s gap between requests
+    Max 50 simultaneous open requests
 ================================================================
 """
 
-import os
-import hashlib
-import logging
-import time
-import warnings
-from datetime import datetime, timedelta
-from typing import Optional
+import os, time, queue, logging, hashlib, threading, warnings
+from datetime import datetime
+from typing   import Dict, List, Optional
 
-import numpy as np
+import numpy  as np
 import pandas as pd
-import yfinance as yf
+
+try:
+    import yfinance as yf
+    _YF_AVAILABLE = True
+except ImportError:
+    _YF_AVAILABLE = False
 
 warnings.filterwarnings("ignore")
-
 import sys
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config.settings import (
-    ASSET_CLASS_MAP, GRANULARITY, LOOKBACK_PERIOD, DAILY_PERIOD,
-    MIN_BARS, DATA_CACHE_DIR,
+    ASSET_CLASS_MAP, GRANULARITY, MIN_BARS, DATA_CACHE_DIR,
     FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS, CRYPTO_TICKERS,
+    IBKR_HOST, IBKR_PORT, IBKR_CLIENT_ID,
 )
 
 logger = logging.getLogger("trading_firm.data")
 
-# ── Asset class mapping ───────────────────────────────────────
-ASSET_CLASS = {}
-for t in FOREX_PAIRS:       ASSET_CLASS[t] = "forex"
-for t in EQUITY_TICKERS:    ASSET_CLASS[t] = "equity"
-for t in COMMODITY_TICKERS: ASSET_CLASS[t] = "commodity"
-for t in CRYPTO_TICKERS:    ASSET_CLASS[t] = "crypto"
+# ── Contract map helpers ───────────────────────────────────────
+def _fx(base, quote):
+    return {"symbol": base, "secType": "CASH", "currency": quote,
+            "exchange": "IDEALPRO", "whatToShow": "MIDPOINT",
+            "yf_ticker": f"{base}{quote}=X"}
 
-# ── Cache helpers ─────────────────────────────────────────────
+def _crypto(sym):
+    return {"symbol": sym, "secType": "CRYPTO", "currency": "USD",
+            "exchange": "PAXOS", "whatToShow": "TRADES",
+            "yf_ticker": f"{sym}-USD"}
 
-def _cache_path(ticker: str, interval: str, period: str) -> str:
-    key  = hashlib.md5(f"{ticker}{interval}{period}".encode()).hexdigest()[:8]
-    name = ticker.replace("=", "").replace("/", "")
+def _stock(sym, primary="NASDAQ"):
+    return {"symbol": sym, "secType": "STK", "currency": "USD",
+            "exchange": "SMART", "primaryExch": primary,
+            "whatToShow": "TRADES", "yf_ticker": sym}
+
+def _cfd(sym, yf_t):
+    return {"symbol": sym, "secType": "CFD", "currency": "USD",
+            "exchange": "SMART", "whatToShow": "MIDPOINT", "yf_ticker": yf_t}
+
+
+# ══════════════════════════════════════════════════════════════
+#  MASTER CONTRACT MAP
+# ══════════════════════════════════════════════════════════════
+CONTRACT_MAP: Dict[str, dict] = {
+
+    # ── USD Majors ────────────────────────────────────────────
+    "EURUSD=X":  _fx("EUR","USD"),
+    "GBPUSD=X":  _fx("GBP","USD"),
+    "USDJPY=X":  _fx("USD","JPY"),
+    "USDCHF=X":  _fx("USD","CHF"),
+    "AUDUSD=X":  _fx("AUD","USD"),
+    "NZDUSD=X":  _fx("NZD","USD"),
+    "USDCAD=X":  _fx("USD","CAD"),
+
+    # ── USD Minors / Exotics ──────────────────────────────────
+    "USDNOK=X":  _fx("USD","NOK"),
+    "USDSEK=X":  _fx("USD","SEK"),
+    "USDDKK=X":  _fx("USD","DKK"),
+    "USDSGD=X":  _fx("USD","SGD"),
+    "USDHKD=X":  _fx("USD","HKD"),
+    "USDMXN=X":  _fx("USD","MXN"),
+    "USDTRY=X":  _fx("USD","TRY"),
+    "USDZAR=X":  _fx("USD","ZAR"),
+    "USDPLN=X":  _fx("USD","PLN"),
+    "USDCZK=X":  _fx("USD","CZK"),
+    "USDHUF=X":  _fx("USD","HUF"),
+    "USDCNH=X":  _fx("USD","CNH"),
+
+    # ── EUR Crosses ───────────────────────────────────────────
+    "EURGBP=X":  _fx("EUR","GBP"),
+    "EURJPY=X":  _fx("EUR","JPY"),
+    "EURCHF=X":  _fx("EUR","CHF"),
+    "EURAUD=X":  _fx("EUR","AUD"),
+    "EURCAD=X":  _fx("EUR","CAD"),
+    "EURNZD=X":  _fx("EUR","NZD"),
+    "EURNOK=X":  _fx("EUR","NOK"),
+    "EURSEK=X":  _fx("EUR","SEK"),
+    "EURPLN=X":  _fx("EUR","PLN"),
+    "EURHUF=X":  _fx("EUR","HUF"),
+    "EURTRY=X":  _fx("EUR","TRY"),
+
+    # ── GBP Crosses ───────────────────────────────────────────
+    "GBPJPY=X":  _fx("GBP","JPY"),
+    "GBPCHF=X":  _fx("GBP","CHF"),
+    "GBPAUD=X":  _fx("GBP","AUD"),
+    "GBPCAD=X":  _fx("GBP","CAD"),
+    "GBPNZD=X":  _fx("GBP","NZD"),
+
+    # ── AUD / NZD Crosses ─────────────────────────────────────
+    "AUDJPY=X":  _fx("AUD","JPY"),
+    "AUDCHF=X":  _fx("AUD","CHF"),
+    "AUDCAD=X":  _fx("AUD","CAD"),
+    "AUDNZD=X":  _fx("AUD","NZD"),
+    "NZDJPY=X":  _fx("NZD","JPY"),
+    "NZDCHF=X":  _fx("NZD","CHF"),
+    "NZDCAD=X":  _fx("NZD","CAD"),
+
+    # ── CAD / CHF Crosses ─────────────────────────────────────
+    "CADJPY=X":  _fx("CAD","JPY"),
+    "CADCHF=X":  _fx("CAD","CHF"),
+    "CHFJPY=X":  _fx("CHF","JPY"),
+
+    # ══════════════════════════════════════════════════════════
+    #  CRYPTO — FREE, no subscription
+    #  Enable: Client Portal → Account Settings → Trading Permissions
+    # ══════════════════════════════════════════════════════════
+    "BTC-USD":   _crypto("BTC"),
+    "ETH-USD":   _crypto("ETH"),
+    "SOL-USD":   _crypto("SOL"),
+    "XRP-USD":   _crypto("XRP"),
+    "BNB-USD":   _crypto("BNB"),
+    "ADA-USD":   _crypto("ADA"),
+    "AVAX-USD":  _crypto("AVAX"),
+    "MATIC-USD": _crypto("MATIC"),
+
+    # ══════════════════════════════════════════════════════════
+    #  EQUITIES — IBKR needs subscription; yfinance covers all
+    # ══════════════════════════════════════════════════════════
+    "NVDA":  _stock("NVDA",  "NASDAQ"),
+    "AAPL":  _stock("AAPL",  "NASDAQ"),
+    "MSFT":  _stock("MSFT",  "NASDAQ"),
+    "GOOGL": _stock("GOOGL", "NASDAQ"),
+    "META":  _stock("META",  "NASDAQ"),
+    "AMZN":  _stock("AMZN",  "NASDAQ"),
+    "TSLA":  _stock("TSLA",  "NASDAQ"),
+    "GS":    _stock("GS",    "NYSE"),
+    "JPM":   _stock("JPM",   "NYSE"),
+    "SPY":   _stock("SPY",   "ARCA"),
+    "EWG":   _stock("EWG",   "ARCA"),
+    "SAP":   _stock("SAP",   "NYSE"),
+
+    # ══════════════════════════════════════════════════════════
+    #  COMMODITIES — IBKR needs subscription; yfinance covers all
+    # ══════════════════════════════════════════════════════════
+    "GC=F":  _cfd("XAUUSD", "GC=F"),
+    "SI=F":  _cfd("XAGUSD", "SI=F"),
+    "NG=F":  _cfd("NATGAS", "NG=F"),
+    "HG=F":  _cfd("COPPER", "HG=F"),
+    "CL=F":  _cfd("CRUDE",  "CL=F"),
+    "ZW=F":  _cfd("WHEAT",  "ZW=F"),
+}
+
+BAR_SIZE_MAP = {"1m":"1 min","5m":"5 mins","15m":"15 mins",
+                "30m":"30 mins","1h":"1 hour","4h":"4 hours","1d":"1 day"}
+DURATION_MAP = {"1m":"7 D","5m":"30 D","15m":"60 D","30m":"60 D",
+                "1h":"1 Y","4h":"2 Y","1d":"5 Y"}
+YF_PERIOD_MAP = {"1m":"7d","5m":"60d","15m":"60d","30m":"60d",
+                 "1h":"2y","4h":"2y","1d":"max"}   # max history for training
+CACHE_TTL_LIVE = 60
+CACHE_TTL_TRAIN = 1440
+
+
+# ── Cache ──────────────────────────────────────────────────────
+def _cache_path(ticker, interval):
+    key  = hashlib.md5(f"{ticker}{interval}".encode()).hexdigest()[:8]
+    name = ticker.replace("=","").replace("/","").replace("-","")
     os.makedirs(DATA_CACHE_DIR, exist_ok=True)
     return os.path.join(DATA_CACHE_DIR, f"{name}_{interval}_{key}.parquet")
 
+def _cache_valid(path, ttl):
+    if not os.path.exists(path): return False
+    return (datetime.now().timestamp()-os.path.getmtime(path))/60 < ttl
 
-def _cache_valid(path: str, max_age_minutes: int = 90) -> bool:
-    if not os.path.exists(path):
-        return False
-    age = datetime.now().timestamp() - os.path.getmtime(path)
-    return age < max_age_minutes * 60
+def _save(df, path):
+    try: df.to_parquet(path)
+    except Exception as e: logger.warning(f"Cache save: {e}")
+
+def _load(path):
+    try: return pd.read_parquet(path)
+    except: return pd.DataFrame()
 
 
-# ── Data quality ──────────────────────────────────────────────
-
-def _validate_and_clean(df: pd.DataFrame, ticker: str) -> pd.DataFrame:
-    """
-    Run quality checks on raw OHLCV data:
-      1. Remove duplicate timestamps
-      2. Forward-fill small gaps (≤ 3 bars)
-      3. Remove price spikes (> 5σ from rolling mean)
-      4. Ensure OHLCV logic (high ≥ low, close within high-low)
-      5. Drop rows with zero volume (for equities)
-    """
-    if df.empty:
-        return df
-
-    # 1. Dedup
-    df = df[~df.index.duplicated(keep="first")]
-    df = df.sort_index()
-
-    # 2. Forward-fill gaps ≤ 3 bars
+# ── Clean ──────────────────────────────────────────────────────
+def _clean(df, ticker):
+    if df.empty: return df
+    df = df[~df.index.duplicated(keep="first")].sort_index()
     df = df.ffill(limit=3)
-
-    # 3. Spike detection on close price
-    roll_mean = df["close"].rolling(20, min_periods=5).mean()
-    roll_std  = df["close"].rolling(20, min_periods=5).std()
-    z_score   = (df["close"] - roll_mean).abs() / (roll_std + 1e-9)
-    spikes    = z_score > 5
-    if spikes.sum() > 0:
-        logger.warning(f"{ticker}: removed {spikes.sum()} spike bars")
-        df = df[~spikes]
-
-    # 4. OHLCV logic validation
-    invalid = (df["high"] < df["low"]) | (df["close"] > df["high"] * 1.01)
-    if invalid.sum() > 0:
-        logger.warning(f"{ticker}: removed {invalid.sum()} invalid OHLC bars")
-        df = df[~invalid]
-
-    # 5. Drop zero-volume rows (equity market close bars)
-    asset = ASSET_CLASS.get(ticker, "equity")
-    if asset == "equity":
-        df = df[df["volume"] > 0]
-
-    return df.dropna(subset=["open", "high", "low", "close"])
+    rm = df["close"].rolling(20,min_periods=5).mean()
+    rs = df["close"].rolling(20,min_periods=5).std()
+    df = df[((df["close"]-rm).abs()/(rs+1e-9)) <= 5]
+    df = df[~((df["high"]<df["low"])|(df["close"]>df["high"]*1.01))]
+    if ASSET_CLASS_MAP.get(ticker)=="equity" and "volume" in df.columns:
+        df = df[df["volume"]>0]
+    return df.dropna(subset=["open","high","low","close"])
 
 
-# ── Primary fetcher: yfinance ─────────────────────────────────
+# ── IBKR singleton ─────────────────────────────────────────────
+# _ibkr_app is one of:
+#   None        → not yet attempted
+#   "offline"   → attempted once, Gateway not running (skip all retries)
+#   App()       → live connected instance
+_ibkr_app, _ibkr_lock, _last_req = None, threading.Lock(), 0.0
 
-def fetch_yfinance(
-    ticker:   str,
-    interval: str = GRANULARITY,
-    period:   str = LOOKBACK_PERIOD,
-    use_cache: bool = True,
-) -> pd.DataFrame:
-    """
-    Fetch OHLCV data from Yahoo Finance with local caching.
+def _get_ibkr():
+    global _ibkr_app
+    with _ibkr_lock:
+        # Already confirmed offline — skip silently, no retry, no warning
+        if _ibkr_app == "offline":
+            return None
+        # Already connected — return immediately
+        if _ibkr_app and _ibkr_app._connected:
+            return _ibkr_app
+        try:
+            from ibapi.client  import EClient
+            from ibapi.wrapper import EWrapper
+            class App(EWrapper, EClient):
+                def __init__(self):
+                    EClient.__init__(self, self)
+                    self._connected=False
+                    self._hq:Dict[int,queue.Queue]={}
+                    self._pq:Dict[int,queue.Queue]={}
+                    self._lk=threading.Lock(); self._rid=2000
+                def _n(self):
+                    with self._lk: r=self._rid; self._rid+=1; return r
+                def nextValidId(self,_): self._connected=True
+                def error(self,rid,code,msg,_=""):
+                    # Suppress: informational, offline (502), no data
+                    if code in(2104,2106,2158,2119,2100,2103,2105,502): return
+                    if code in(162,200,354,10089,10090):
+                        if rid in self._hq: self._hq[rid].put(None)
+                        return
+                    logger.warning(f"IBKR[{code}] r={rid}: {msg}")
+                    if rid in self._hq: self._hq[rid].put(None)
+                def historicalData(self,rid,bar):
+                    if rid in self._hq:
+                        self._hq[rid].put({"date":bar.date,"open":float(bar.open),
+                            "high":float(bar.high),"low":float(bar.low),
+                            "close":float(bar.close),"volume":float(bar.volume)})
+                def historicalDataEnd(self,rid,*_):
+                    if rid in self._hq: self._hq[rid].put(None)
+                def tickPrice(self,rid,tt,price,_):
+                    if rid in self._pq: self._pq[rid].put((tt,price))
+                def tickSnapshotEnd(self,rid):
+                    if rid in self._pq: self._pq[rid].put((-1,-1))
+            app=App()
+            app.connect(IBKR_HOST,IBKR_PORT,IBKR_CLIENT_ID+1)
+            threading.Thread(target=app.run,daemon=True).start()
+            for _ in range(50):
+                if app._connected: break
+                time.sleep(0.1)
+            if not app._connected:
+                # Mark as offline — no more retries or warnings this session
+                _ibkr_app = "offline"
+                logger.info("IB Gateway offline → yfinance fallback active for this session")
+                return None
+            _ibkr_app=app
+            logger.info(f"IBKR data app connected | port={IBKR_PORT}")
+            return app
+        except ImportError:
+            _ibkr_app = "offline"
+            logger.warning("ibapi not installed — pip install ibapi")
+            return None
+        except Exception as e:
+            _ibkr_app = "offline"
+            logger.debug(f"IBKR connect skipped: {e}")
+            return None
 
-    Parameters
-    ----------
-    ticker   : Yahoo Finance symbol e.g. "EURUSD=X", "AAPL", "GC=F"
-    interval : "1m","5m","15m","30m","60m","1d"
-    period   : "7d","60d","1y","2y" etc.
-    """
-    cache = _cache_path(ticker, interval, period)
 
-    if use_cache and _cache_valid(cache):
-        df = pd.read_parquet(cache)
-        logger.debug(f"{ticker}: loaded from cache ({len(df)} bars)")
-        return df
+def _make_contract(params):
+    from ibapi.contract import Contract
+    c=Contract(); c.symbol=params["symbol"]; c.secType=params["secType"]
+    c.currency=params["currency"]; c.exchange=params["exchange"]
+    if "primaryExch" in params: c.primaryExch=params["primaryExch"]
+    return c
 
+def _parse_date(d):
+    d=str(d).split(" US/")[0].split(" America/")[0].strip()
+    for fmt in("%Y%m%d %H:%M:%S","%Y%m%d"):
+        try: return datetime.strptime(d,fmt)
+        except: pass
+    return None
+
+
+# ── IBKR fetch ─────────────────────────────────────────────────
+def _fetch_ibkr(ticker, interval="1h"):
+    global _last_req
+    app=_get_ibkr()
+    if not app: return pd.DataFrame()
+    params=CONTRACT_MAP.get(ticker)
+    if not params: return pd.DataFrame()
+    gap=time.time()-_last_req
+    if gap<0.5: time.sleep(0.5-gap)
     try:
-        import time as _time
-        raw = pd.DataFrame()
-        for attempt in range(3):
+        rid=app._n(); q=queue.Queue(); app._hq[rid]=q
+        app.reqHistoricalData(rid,_make_contract(params),"",
+            DURATION_MAP.get(interval,"1 Y"),BAR_SIZE_MAP.get(interval,"1 hour"),
+            params.get("whatToShow","MIDPOINT"),0,1,False,[])
+        _last_req=time.time()
+        bars=[]; deadline=time.time()+45
+        while time.time()<deadline:
             try:
-                raw = yf.download(ticker, interval=interval, period=period,
-                          progress=False, auto_adjust=True, multi_level_index=False)
-                if not raw.empty:
-                    break
-                _time.sleep(2 ** attempt)   # 1s, 2s, 4s backoff
-            except Exception as _e:
-                logger.warning(f"{ticker}: attempt {attempt+1} failed — {_e}")
-                _time.sleep(2 ** attempt)
-        if raw.empty:
-            raise ValueError(f"No data returned for {ticker}")
-
-        #raw.columns = [c.lower() for c in raw.columns]
-        #df = raw[["open", "high", "low", "close", "volume"]].copy()
-        
-        # Flatten MultiIndex if present, then lowercase
-        if hasattr(raw.columns, "levels"):
-            raw.columns = raw.columns.get_level_values(0)
-        raw.columns = [str(c).lower().strip() for c in raw.columns]
-
-        # Rename any variant column names
-        raw = raw.rename(columns={
-            "adj close": "close",
-            "adjclose":  "close",
-        })
-        df = raw[[c for c in ["open", "high", "low", "close", "volume"] if c in raw.columns]].copy()
-
-        # Add volume column with zeros if missing (forex has no volume)
-        if "volume" not in df.columns:
-            df["volume"] = 0
-
-        
-        df.index.name = "time"
-        df.index = pd.to_datetime(df.index)
-
-        if hasattr(df.index, "tz") and df.index.tz is not None:
-            df.index = df.index.tz_localize(None)
-
-        df = _validate_and_clean(df, ticker)
-
-        if len(df) < MIN_BARS:
-            logger.warning(f"{ticker}: only {len(df)} bars after cleaning "
-                           f"(min={MIN_BARS})")
-
-        df.to_parquet(cache)
-        logger.info(f"{ticker}: fetched {len(df)} bars @ {interval}")
-        return df
-
+                b=q.get(timeout=1.0)
+                if b is None: break
+                bars.append(b)
+            except queue.Empty: continue
     except Exception as e:
-        logger.error(f"{ticker}: yfinance fetch failed — {e}")
-        if os.path.exists(cache):
-            logger.warning(f"{ticker}: falling back to stale cache")
-            return pd.read_parquet(cache)
-        return pd.DataFrame()
-
-# ── Smart multi-source fetcher ────────────────────────────────
-
-def fetch_ohlcv(
-    ticker:    str,
-    interval:  str  = GRANULARITY,
-    days:      int  = 730,
-    use_cache: bool = True,
-) -> pd.DataFrame:
-    """
-    Fetch OHLCV for any ticker, routing to the best available
-    data source for that asset class.
-
-    Priority:
-      forex     → OANDA  → yfinance
-      equity    → Alpaca → yfinance
-      crypto    → Binance (always works, no key) → yfinance
-      commodity → yfinance
-
-    Results are cached to parquet regardless of which source
-    was used, so the same cache logic applies everywhere.
-    """
-    period     = _days_to_period(days)
-    cache_path = _cache_path(ticker, interval, period)
-
-    if use_cache and _cache_valid(cache_path):
-        df = pd.read_parquet(cache_path)
-        logger.debug(f"{ticker}: loaded from cache ({len(df)} bars)")
-        return df
-
-    asset_class = ASSET_CLASS.get(ticker, "equity")
-    df          = pd.DataFrame()
-
-    # ── Route to best source ──────────────────────────────────
-    if asset_class == "forex":
-        try:
-            from data.sources.oanda import fetch_oanda
-            df = fetch_oanda(ticker, interval=interval, days=days)
-        except Exception as e:
-            logger.warning(f"{ticker}: OANDA failed ({e}) — trying yfinance")
-
-    elif asset_class == "equity":
-        try:
-            from data.sources.alpaca import fetch_alpaca
-            df = fetch_alpaca(ticker, interval=interval, days=days)
-        except Exception as e:
-            logger.warning(f"{ticker}: Alpaca failed ({e}) — trying yfinance")
-
-    elif asset_class == "crypto":
-        try:
-            from data.sources.binance import fetch_binance
-            df = fetch_binance(ticker, interval=interval, days=days)
-        except Exception as e:
-            logger.warning(f"{ticker}: Binance failed ({e}) — trying yfinance")
-
-    # Commodity always goes to yfinance (no free alternative)
-    # Any failed primary source also falls through to yfinance
-    if df.empty:
-        logger.info(f"{ticker}: falling back to yfinance")
-        df = fetch_yfinance(ticker, interval=interval, period=period,
-                            use_cache=False)   # cache handled below
-
-    if df.empty:
-        logger.error(f"{ticker}: all sources failed — no data")
-        return pd.DataFrame()
-
-    df = _validate_and_clean(df, ticker)
-    if not df.empty:
-        df.to_parquet(cache_path)
-
+        logger.error(f"{ticker}: IBKR error — {e}"); return pd.DataFrame()
+    finally: app._hq.pop(rid,None)
+    if not bars: return pd.DataFrame()
+    df=pd.DataFrame(bars)
+    df["time"]=df["date"].apply(_parse_date)
+    df=df.dropna(subset=["time"]).set_index("time")
+    df=df[["open","high","low","close","volume"]].astype(float)
+    df.index.name="time"
+    df=df.sort_index()[~df.index.duplicated(keep="first")]
+    logger.info(f"{ticker}(IBKR): {len(df)} {interval} | {df.index[0].date()}→{df.index[-1].date()}")
     return df
 
 
-def _days_to_period(days: int) -> str:
-    """Convert a day count to the nearest yfinance period string."""
-    if days <= 7:    return "7d"
-    if days <= 30:   return "1mo"
-    if days <= 60:   return "60d"
-    if days <= 90:   return "3mo"
-    if days <= 180:  return "6mo"
-    if days <= 365:  return "1y"
-    if days <= 730:  return "2y"
-    return "max"
-
-
-def fetch_macro_context(use_cache: bool = True) -> dict:
-    """
-    Fetch VIX and DXY daily bars.
-
-    Primary source: FRED API (official, free, highly reliable)
-    Fallback:       yfinance (^VIX, DX-Y.NYB)
-
-    Returns dict with keys 'vix' and 'dxy' as pd.Series of close prices.
-    """
-    # ── Try FRED first ────────────────────────────────────────
+# ── yfinance fallback ──────────────────────────────────────────
+def _fetch_yf(ticker, interval="1h"):
+    if not _YF_AVAILABLE: return pd.DataFrame()
+    yf_sym=CONTRACT_MAP.get(ticker,{}).get("yf_ticker",ticker)
+    period=YF_PERIOD_MAP.get(interval,"2y")
+    if interval in("1m","5m","15m","30m"): period="60d"
     try:
-        from data.sources.fred import fetch_fred
-        vix = fetch_fred("vix", days=730)
-        dxy = fetch_fred("dxy", days=730)
-
-        if not vix.empty and not dxy.empty:
-            logger.info(f"Macro context loaded from FRED "
-                        f"(VIX: {len(vix)} bars, DXY: {len(dxy)} bars)")
-            return {"vix": vix, "dxy": dxy}
+        raw=yf.download(yf_sym,interval=interval,period=period,
+                        progress=False,auto_adjust=True,multi_level_index=False)
+        if raw.empty: return pd.DataFrame()
+        if hasattr(raw.columns,"levels"): raw.columns=raw.columns.get_level_values(0)
+        raw.columns=[str(c).lower().strip() for c in raw.columns]
+        raw=raw.rename(columns={"adj close":"close","adjclose":"close"})
+        cols=[c for c in["open","high","low","close","volume"] if c in raw.columns]
+        df=raw[cols].copy()
+        if "volume" not in df.columns: df["volume"]=0.0
+        df.index=pd.to_datetime(df.index)
+        if hasattr(df.index,"tz") and df.index.tz: df.index=df.index.tz_localize(None)
+        df.index.name="time"
+        logger.info(f"{ticker}(yf): {len(df)} {interval} | {df.index[0].date()}→{df.index[-1].date()}")
+        return df
     except Exception as e:
-        logger.warning(f"FRED macro fetch failed ({e}) — falling back to yfinance")
+        logger.error(f"{ticker}: yfinance — {e}"); return pd.DataFrame()
 
-    # ── Fallback: yfinance ────────────────────────────────────
-    macro   = {}
-    tickers = {"vix": "^VIX", "dxy": "DX-Y.NYB"}
 
-    for name, ticker in tickers.items():
-        try:
-            df = fetch_yfinance(ticker, interval="1d", period="730d",
-                                use_cache=use_cache)
-            if not df.empty:
-                macro[name] = df["close"]
-                logger.info(f"Macro {name}: {len(df)} daily bars (yfinance fallback)")
-            else:
-                macro[name] = None
-                logger.warning(f"Macro {name}: no data returned")
-        except Exception as e:
-            macro[name] = None
-            logger.warning(f"Macro {name}: yfinance fallback failed — {e}")
+# ── Public API ─────────────────────────────────────────────────
+def fetch_ohlcv(ticker, interval=GRANULARITY, days=365,
+                use_cache=True, training_mode=False):
+    ttl=CACHE_TTL_TRAIN if training_mode else CACHE_TTL_LIVE
+    cache=_cache_path(ticker,interval)
+    if use_cache and _cache_valid(cache,ttl):
+        df=_load(cache)
+        if not df.empty: return df
+    df=_fetch_ibkr(ticker,interval)
+    if df.empty: df=_fetch_yf(ticker,interval)
+    if df.empty:
+        if os.path.exists(cache):
+            logger.warning(f"{ticker}: stale cache fallback")
+            return _load(cache)
+        return pd.DataFrame()
+    df=_clean(df,ticker)
+    if not df.empty: _save(df,cache)
+    return df
 
+
+def fetch_live_price(ticker):
+    app=_get_ibkr()
+    if app:
+        params=CONTRACT_MAP.get(ticker)
+        if params:
+            try:
+                rid=app._n(); q=queue.Queue(); app._pq[rid]=q
+                app.reqMktData(rid,_make_contract(params),"",True,False,[])
+                bid=ask=0.0; deadline=time.time()+4
+                while time.time()<deadline:
+                    try:
+                        tt,p=q.get(timeout=0.3)
+                        if tt==-1: break
+                        if tt==1 and p>0: bid=p
+                        if tt==2 and p>0: ask=p
+                        if bid>0 and ask>0: break
+                    except queue.Empty: break
+                app.cancelMktData(rid); app._pq.pop(rid,None)
+                if bid>0 or ask>0: return (bid+ask)/2 if bid and ask else max(bid,ask)
+            except: pass
+    cache=_cache_path(ticker,GRANULARITY)
+    if os.path.exists(cache):
+        df=_load(cache)
+        if not df.empty: return float(df["close"].iloc[-1])
+    return 0.0
+
+
+def fetch_macro_context(use_cache=True):
+    macro={}
+    for name,sym in[("vix","^VIX"),("dxy","DX-Y.NYB")]:
+        df=_fetch_yf(sym,"1d")
+        macro[name]=df["close"] if not df.empty else None
     return macro
 
-def update_intraday_cache(pair: str, yf_ticker: str, is_crypto: bool = False) -> pd.DataFrame:
-    """
-    Fetch latest 5-min bars and append to local parquet cache.
-    Run daily to build up history beyond yfinance's 60-day limit.
-    Call this at the start of each paper trading cycle.
-    """
-    cache_path = f"data/cache/intraday/{pair}_5min.parquet"
-    os.makedirs("data/cache/intraday", exist_ok=True)
 
-    # Load existing cache
-    if os.path.exists(cache_path):
-        existing  = pd.read_parquet(cache_path)
-        last_date = existing.index[-1]
-        logger.info(f"{pair}: cache loaded — {len(existing)} bars, last={last_date.date()}")
-    else:
-        existing  = pd.DataFrame()
-        last_date = None
+def check_data_sources():
+    app  = _get_ibkr()
+    ibkr = app is not None and app != "offline" and hasattr(app, "_connected") and app._connected
+    status = {"ibkr_gateway": ibkr, "yfinance": _YF_AVAILABLE}
+    logger.info(f"Data: IBKR={'✅' if ibkr else '❌(yf fallback)'}  yfinance={'✅' if _YF_AVAILABLE else '❌'}")
+    return status
 
-    # Fetch latest 7 days from yfinance
-    for attempt in range(3):
-        try:
-            df_new = yf.download(
-                yf_ticker, interval="5m", period="7d",
-                progress=False, multi_level_index=False
-            )
-            if not df_new.empty:
-                break
-        except Exception as e:
-            logger.warning(f"{pair}: cache update attempt {attempt+1} failed — {e}")
-            time.sleep(2 ** attempt)
-    else:
-        logger.warning(f"{pair}: cache update failed — using existing cache")
-        return existing if not existing.empty else pd.DataFrame()
-
-    df_new.columns = [c.lower() for c in df_new.columns]
-    df_new.index   = df_new.index.tz_localize(None)
-
-    # Session filter for forex
-    if not is_crypto:
-        df_new = df_new[
-            (df_new.index.weekday < 5) &
-            (df_new.index.hour >= 7)   &
-            (df_new.index.hour < 21)
-        ]
-
-    # Append only new bars
-    if last_date is not None:
-        df_new = df_new[df_new.index > last_date]
-
-    if df_new.empty:
-        logger.info(f"{pair}: cache already up to date")
-        return existing
-
-    combined = pd.concat([existing, df_new])
-    combined = combined[~combined.index.duplicated(keep="last")]
-    combined.to_parquet(cache_path)
-
-    logger.info(
-        f"{pair}: cache updated — added {len(df_new)} bars | "
-        f"total={len(combined)} | now → {combined.index[-1].date()}"
-    )
-    return combined
-
-
-# ── Secondary fetcher: Histdata CSV ──────────────────────────
-
-def load_histdata_csv(
-    path_pattern: str,
-    resample_to:  str = "5min",
-) -> pd.DataFrame:
-    """
-    Load one or more Histdata.com M1 CSV files.
-    Supports glob patterns: e.g. "data/DAT_MT_EURUSD_M1_*.csv"
-
-    Parameters
-    ----------
-    path_pattern : file path or glob pattern
-    resample_to  : target timeframe e.g. "5min","15min","1h"
-    """
-    import glob as _glob
-
-    files = sorted(_glob.glob(path_pattern))
-    if not files:
-        raise FileNotFoundError(
-            f"No CSV files found matching: {path_pattern}\n"
-            f"Download from https://www.histdata.com"
-        )
-
-    dfs = []
-    for f in files:
-        try:
-            tmp = pd.read_csv(
-                f, sep="\t", header=None,
-                names=["date", "time", "open", "high", "low", "close", "volume"],
-            )
-            tmp.index = pd.to_datetime(
-                tmp["date"] + " " + tmp["time"],
-                format="%Y.%m.%d %H:%M"
-            )
-            tmp = tmp.drop(columns=["date", "time"]).astype(float)
-            dfs.append(tmp)
-            logger.debug(f"Loaded histdata: {f} ({len(tmp)} bars)")
-        except Exception as e:
-            logger.warning(f"Could not load {f}: {e}")
-
-    if not dfs:
-        return pd.DataFrame()
-
-    df = pd.concat(dfs).sort_index()
-    df = df[~df.index.duplicated(keep="first")]
-
-    if resample_to and resample_to != "1min":
-        df = df.resample(resample_to).agg({
-            "open":   "first",
-            "high":   "max",
-            "low":    "min",
-            "close":  "last",
-            "volume": "sum",
-        }).dropna()
-
-    logger.info(
-        f"Histdata loaded: {len(df)} {resample_to} bars "
-        f"| {df.index[0].date()} → {df.index[-1].date()}"
-    )
-    return df
-
-
-# ── Bulk fetcher ──────────────────────────────────────────────
 
 class DataPipeline:
-    """
-    Manages data fetching for all instruments in the universe.
-    Maintains an in-memory store of latest OHLCV DataFrames.
-    """
+    def __init__(self): self._store:Dict[str,pd.DataFrame]={}
 
-    def __init__(self):
-        self._store: dict[str, pd.DataFrame] = {}
-
-    def refresh_all(
-        self,
-        tickers:  list = None,
-        interval: str  = GRANULARITY,
-        days:     int  = 730,
-        use_cache: bool = True,
-    ) -> dict:
-        """
-        Fetch/refresh data for all (or given) tickers.
-        Returns dict of {ticker: DataFrame}.
-        """
-        tickers = tickers or (FOREX_PAIRS + EQUITY_TICKERS + COMMODITY_TICKERS + CRYPTO_TICKERS)
-        failed  = []
-
-        for ticker in tickers:
-            from config.settings import ASSET_CLASS_MAP
-            asset_class = ASSET_CLASS_MAP.get(ticker, "equity")
-            data_days   = {"forex": 730, "equity": 730,
-                           "commodity": 730, "crypto": 730}.get(asset_class, days)
-            df = fetch_ohlcv(ticker, interval=interval,
-                             days=data_days, use_cache=use_cache)
-
-            if df.empty:
-                failed.append(ticker)
-                logger.warning(f"No data for {ticker} — skipping")
-            else:
-                self._store[ticker] = df
-
-        if failed:
-            logger.warning(f"Failed to fetch: {failed}")
-
-        logger.info(
-            f"DataPipeline refreshed: {len(self._store)} instruments "
-            f"({len(failed)} failed)"
-        )
+    def refresh_all(self,tickers=None,interval=GRANULARITY,days=365,
+                    use_cache=True,training_mode=False):
+        tickers=tickers or(FOREX_PAIRS+EQUITY_TICKERS+COMMODITY_TICKERS+CRYPTO_TICKERS)
+        failed=[]
+        logger.info(f"Refreshing {len(tickers)} instruments | {interval} | train={training_mode}")
+        for t in tickers:
+            df=fetch_ohlcv(t,interval=interval,days=days,
+                           use_cache=use_cache,training_mode=training_mode)
+            if df.empty: failed.append(t)
+            else: self._store[t]=df
+        if failed: logger.warning(f"Failed: {failed}")
+        logger.info(f"Pipeline ready: {len(self._store)} loaded | {len(failed)} failed")
         return self._store
 
-    def get(self, ticker: str) -> pd.DataFrame:
-        """Return cached DataFrame for a ticker."""
-        return self._store.get(ticker, pd.DataFrame())
+    def get(self,ticker): return self._store.get(ticker,pd.DataFrame())
+    def get_latest_price(self,ticker): return fetch_live_price(ticker)
+    def refresh_one(self,ticker,interval=GRANULARITY):
+        df=fetch_ohlcv(ticker,interval=interval,use_cache=False)
+        if not df.empty: self._store[ticker]=df
+        return df
+    def available(self): return[t for t,df in self._store.items() if not df.empty]
 
-    def get_latest_price(self, ticker: str) -> float:
-        """Return the most recent close price."""
-        df = self.get(ticker)
-        if df.empty:
-            return 0.0
-        return float(df["close"].iloc[-1])
-
-    def available(self) -> list:
-        """Return list of tickers with valid data."""
-        return [t for t, df in self._store.items() if not df.empty]
+    def summary(self):
+        print(f"\n{'─'*72}")
+        print(f"  DataPipeline — {len(self._store)} instruments")
+        print(f"{'─'*72}")
+        for t,df in sorted(self._store.items()):
+            a=ASSET_CLASS_MAP.get(t,"?")
+            if df.empty: print(f"  {t:<18} {a:<12}  NO DATA")
+            else: print(f"  {t:<18} {a:<12}  {len(df):>6} bars  "
+                        f"{df.index[0].date()} → {df.index[-1].date()}")
+        print(f"{'─'*72}\n")
 
     @property
-    def store(self) -> dict:
-        return self._store
+    def store(self): return self._store
+
+
+# Backward compatibility
+def fetch_yfinance(ticker,interval=GRANULARITY,period="730d",use_cache=True):
+    return _fetch_yf(ticker,interval)
+def update_intraday_cache(pair,yf_ticker=None,is_crypto=False):
+    return fetch_ohlcv(pair,interval="5m",use_cache=False)
+def load_histdata_csv(path_pattern,resample_to="5min"):
+    import glob as _g
+    files=sorted(_g.glob(path_pattern))
+    if not files: raise FileNotFoundError(f"No CSV: {path_pattern}")
+    dfs=[]
+    for f in files:
+        try:
+            tmp=pd.read_csv(f,sep="\t",header=None,
+                names=["date","time","open","high","low","close","volume"])
+            tmp.index=pd.to_datetime(tmp["date"]+" "+tmp["time"],format="%Y.%m.%d %H:%M")
+            dfs.append(tmp.drop(columns=["date","time"]).astype(float))
+        except Exception as e: logger.warning(f"Histdata {f}: {e}")
+    if not dfs: return pd.DataFrame()
+    df=pd.concat(dfs).sort_index()[lambda x:~x.index.duplicated(keep="first")]
+    if resample_to and resample_to!="1min":
+        df=df.resample(resample_to).agg({"open":"first","high":"max",
+            "low":"min","close":"last","volume":"sum"}).dropna()
+    return df

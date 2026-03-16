@@ -165,6 +165,14 @@ class StackedEnsemble:
     def _make_mlp(self):
         return MLPClassifier(**MLPC_PARAMS)
 
+    def _make_lstm(self, n_features: int, n_classes: int):
+        from signals.lstm_model import LSTMClassifier
+        return LSTMClassifier(
+            n_features=n_features,
+            n_classes=n_classes,
+            random_state=42,
+        )
+
     # ── Training ─────────────────────────────────────────────
 
     def train(self, X: np.ndarray, y: np.ndarray) -> dict:
@@ -259,6 +267,11 @@ class StackedEnsemble:
                 f"MLP={mlpc_scores[-1]:.4f}"
             )
 
+        # ── LSTM OOF (separate loop — uses selected features) ────
+        # LSTM is run after feature selection so its sequence inputs
+        # are the same reduced feature set used by the meta-learner.
+        oof_lstm = np.zeros((n, n_classes))
+
         # ── Feature selection using XGBoost importances ───────
         # Train a quick XGBoost on full data to get importances
         _selector_xgb = self._make_xgb()
@@ -293,10 +306,12 @@ class StackedEnsemble:
         oof_rf   = np.zeros((n, n_classes))
         oof_mlp  = np.zeros((n, n_classes))     
 
+        lstm_scores = []
         for fold, (tr_idx, val_idx) in enumerate(tscv.split(X)):
             X_tr, X_val = X[tr_idx], X[val_idx]
             y_tr_xg     = y_xg[tr_idx]
             y_tr_raw    = y[tr_idx]
+            y_val_raw   = y[val_idx]
 
             _x = self._make_xgb();  _x.fit(X_tr, y_tr_xg)
             oof_xgb[val_idx]  = _x.predict_proba(X_val)[:, :n_classes]
@@ -309,10 +324,21 @@ class StackedEnsemble:
 
             _m = self._make_mlp();  _m.fit(X_tr, y_tr_xg)
             oof_mlp[val_idx]  = _m.predict_proba(X_val)[:, :n_classes]
-        
+
+            # LSTM — trained on selected features with encoded labels
+            try:
+                _lstm = self._make_lstm(n_features=X_tr.shape[1], n_classes=n_classes)
+                _lstm.fit(X_tr, y_tr_xg)
+                lstm_p = _lstm.predict_proba(X_val)[:, :n_classes]
+                oof_lstm[val_idx] = lstm_p
+                lstm_preds = self._dec(_lstm.predict(X_val))
+                lstm_scores.append(accuracy_score(y_val_raw, lstm_preds))
+            except Exception as _e:
+                logger.debug(f"LSTM fold {fold} skipped: {_e}")
+                oof_lstm[val_idx] = 1.0 / n_classes   # neutral fallback
 
         # ── Stack OOF probs as meta-features ─────────────────
-        meta_X = np.hstack([oof_xgb, oof_lgbm, oof_rf, oof_mlp])   # (n, 12)
+        meta_X = np.hstack([oof_xgb, oof_lgbm, oof_rf, oof_mlp, oof_lstm])  # (n, 15)
         meta_X = self.scaler.fit_transform(meta_X)
 
         # Meta-learner uses raw [-1,0,1] labels
@@ -336,13 +362,27 @@ class StackedEnsemble:
         self.base_models["rf"]   = self._make_rf()
         self.base_models["rf"].fit(X, y)         # RF uses raw labels
 
+        # LSTM full-data retrain (on selected features)
+        try:
+            self.base_models["lstm"] = self._make_lstm(
+                n_features=X.shape[1], n_classes=n_classes
+            )
+            self.base_models["lstm"].fit(X, y_xg)
+        except Exception as _e:
+            logger.warning(f"LSTM full retrain failed: {_e} — using neutral proba")
+            self.base_models["lstm"] = None
+
         self.is_trained = True
+
+        lstm_mean = np.mean(lstm_scores) if lstm_scores else 0.0
+        lstm_std  = np.std(lstm_scores)  if lstm_scores else 0.0
 
         self._cv_metrics = {
             "xgb":      {"mean": np.mean(xgb_scores),  "std": np.std(xgb_scores)},
             "lgbm":     {"mean": np.mean(lgbm_scores), "std": np.std(lgbm_scores)},
             "rf":       {"mean": np.mean(rf_scores),   "std": np.std(rf_scores)},
             "mlp":      {"mean": np.mean(mlpc_scores), "std": np.std(mlpc_scores)},
+            "lstm":     {"mean": lstm_mean,             "std": lstm_std},
             "ensemble": {"meta_accuracy": meta_acc},
         }
 
@@ -352,6 +392,7 @@ class StackedEnsemble:
             f"  LGBM    : {np.mean(lgbm_scores):.4f} ± {np.std(lgbm_scores):.4f}\n"
             f"  RF      : {np.mean(rf_scores):.4f} ± {np.std(rf_scores):.4f}\n"
             f"  MLP     : {np.mean(mlpc_scores):.4f} ± {np.std(mlpc_scores):.4f}\n"
+            f"  LSTM    : {lstm_mean:.4f} ± {lstm_std:.4f}\n"
             f"  Ensemble meta-accuracy: {meta_acc:.4f}"
         )
         return self._cv_metrics
@@ -378,7 +419,17 @@ class StackedEnsemble:
         p_rf   = self.base_models["rf"].predict_proba(X)
         p_mlp  = self.base_models["mlp"].predict_proba(X)
 
-        meta_X = np.hstack([p_xgb, p_lgbm, p_rf, p_mlp])   
+        # LSTM — graceful fallback to neutral if unavailable
+        lstm_model = self.base_models.get("lstm")
+        if lstm_model is not None:
+            try:
+                p_lstm = lstm_model.predict_proba(X)[:, :p_xgb.shape[1]]
+            except Exception:
+                p_lstm = np.full_like(p_xgb, 1.0 / p_xgb.shape[1])
+        else:
+            p_lstm = np.full_like(p_xgb, 1.0 / p_xgb.shape[1])
+
+        meta_X = np.hstack([p_xgb, p_lgbm, p_rf, p_mlp, p_lstm])
         meta_X = self.scaler.transform(meta_X)
         return self.meta_learner.predict_proba(meta_X)
 

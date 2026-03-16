@@ -533,6 +533,53 @@ class RiskEngine:
             "total_trades":     len(self._trade_history),
         }
 
+    def var_cvar_report(self, confidence: float = 0.95) -> dict:
+        """
+        Compute historical VaR and CVaR from closed trade P&L.
+
+        Returns a dict suitable for logging or dashboard display.
+        Empty dict if fewer than 20 trades on record.
+        """
+        from risk.stress_test import compute_var_cvar
+
+        if len(self._trade_history) < 20:
+            return {}
+
+        pnl_series = pd.Series([t["pnl"] for t in self._trade_history])
+        returns    = pnl_series / self.nav   # convert to fraction of NAV
+
+        result = compute_var_cvar(returns, confidence=confidence, capital=self.nav)
+        logger.info(
+            f"VaR ({confidence:.0%}): {result['var_pct']:.2%} "
+            f"(€{result['var_usd']:,.2f}) | "
+            f"CVaR: {result['cvar_pct']:.2%} "
+            f"(€{result['cvar_usd']:,.2f}) | "
+            f"n={result['n_obs']}"
+        )
+        return result
+
+    def stress_test(self, open_positions: list) -> dict:
+        """
+        Run all four historical stress scenarios against current open positions.
+
+        Parameters
+        ----------
+        open_positions : list from broker.get_open_positions()
+
+        Returns dict keyed by scenario name — see risk.stress_test.run_stress_test
+        """
+        from risk.stress_test import run_stress_test
+        from config.settings import ASSET_CLASS_MAP
+
+        results = run_stress_test(open_positions, ASSET_CLASS_MAP, self.nav)
+
+        for key, res in results.items():
+            logger.info(
+                f"Stress [{res['label']}]: "
+                f"P&L={res['pnl']:+,.2f} ({res['pnl_pct']:+.2%})"
+            )
+        return results
+
     @property
     def trade_history(self) -> pd.DataFrame:
         if not self._trade_history:
