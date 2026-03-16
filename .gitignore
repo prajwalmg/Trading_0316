@@ -76,3 +76,6 @@ htmlcov/
 data/
 models/
 venv/
+venv/
+__pycache__/
+*.pyc
