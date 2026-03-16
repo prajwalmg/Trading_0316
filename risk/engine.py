@@ -292,7 +292,16 @@ class RiskEngine:
             if ASSET_CLASS_MAP.get(p.get("instrument", ""), "") == asset_class
         )
         reduction = 0.8 ** same_class_count
-        adjusted  = max(1, int(base_units * reduction))
+        raw       = base_units * reduction
+        # Crypto positions can be fractional (e.g. 0.0012 BTC)
+        asset_class = ASSET_CLASS_MAP.get(instrument) or \
+              ASSET_CLASS_MAP.get(f"{instrument}-USD") or \
+              ASSET_CLASS_MAP.get(f"{instrument}=X") or \
+              "equity"
+        if asset_class == "crypto":
+            adjusted = round(max(0.0001, raw), 4)
+        else:
+            adjusted = max(1, int(raw))
         if adjusted != base_units:
             logger.debug(
                 f"{instrument}: size reduced {base_units}→{adjusted} "

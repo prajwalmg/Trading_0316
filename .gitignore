@@ -69,13 +69,18 @@ htmlcov/
 *.tmp
 *.bak
 *.orig
+
+# Downloaded data files (regenerated automatically — do not commit)
 *.csv
-*.pkl
 *.parquet
 *.h5
-data/
-models/
-venv/
-venv/
+data/cache/
+data/histdata/
+
+# Saved model binaries (too large for GitHub — retrain locally)
+models/saved/
+*.pkl
+
+# Duplicate venv entries (already above)
 __pycache__/
 *.pyc

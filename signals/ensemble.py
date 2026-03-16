@@ -31,13 +31,68 @@ import numpy as np
 import pandas as pd
 
 from sklearn.neural_network  import MLPClassifier
-from sklearn.model_selection import TimeSeriesSplit
+
 from sklearn.ensemble        import RandomForestClassifier
 from sklearn.linear_model    import LogisticRegression
 from sklearn.preprocessing   import StandardScaler
 from sklearn.metrics         import accuracy_score, classification_report
 from xgboost                 import XGBClassifier
 from lightgbm                import LGBMClassifier
+
+
+# ── Purged Walk-Forward CV ────────────────────────────────────
+
+class PurgedTimeSeriesSplit:
+    """
+    Walk-forward CV with a purge gap and embargo period.
+
+    Purge gap  — removes training samples whose feature windows
+                 overlap with the validation period.  Set to the
+                 longest indicator lookback (default 200 bars for
+                 EMA-200).
+
+    Embargo    — removes the first N bars of validation to prevent
+                 leakage from the last training bar's market impact.
+
+    Without this, an EMA-200 feature at the last training bar uses
+    the same prices as the first validation bar — information leaks
+    both ways across the fold boundary.
+    """
+
+    def __init__(
+        self,
+        n_splits:     int = 5,
+        purge_bars:   int = 200,   # longest feature lookback
+        embargo_bars: int = 10,    # bars to drop at start of val
+    ):
+        self.n_splits     = n_splits
+        self.purge_bars   = purge_bars
+        self.embargo_bars = embargo_bars
+
+    def split(self, X, y=None, groups=None):  # noqa: y/groups unused (sklearn API)
+        n         = len(X)
+        fold_size = n // (self.n_splits + 1)
+
+        for i in range(1, self.n_splits + 1):
+            train_end = i * fold_size
+
+            # Purge: drop the last purge_bars of training so feature
+            # windows don't overlap with the start of validation.
+            purged_train_end = max(0, train_end - self.purge_bars)
+            train_idx = np.arange(0, purged_train_end)
+
+            # Validation starts right after the original train_end
+            # (not the purged end) plus an embargo buffer.
+            val_start = train_end + self.embargo_bars
+            val_end   = val_start + fold_size
+            if val_end > n or len(train_idx) < 50:
+                break
+
+            val_idx = np.arange(val_start, val_end)
+            yield train_idx, val_idx
+
+    def get_n_splits(self, X=None, y=None, groups=None):  # noqa: sklearn API
+        return self.n_splits
 
 warnings.filterwarnings("ignore")
 
@@ -134,7 +189,11 @@ class StackedEnsemble:
             f"samples={n} | features={X.shape[1]}"
         )
 
-        tscv = TimeSeriesSplit(n_splits=CV_SPLITS)
+        # PurgedTimeSeriesSplit: purge 200 bars (= longest feature lookback,
+        # EMA-200) + 10-bar embargo so no feature window straddles the fold.
+        tscv = PurgedTimeSeriesSplit(
+            n_splits=CV_SPLITS, purge_bars=200, embargo_bars=10
+        )
 
         n_classes = len(np.unique(y))
         oof_xgb  = np.zeros((n, n_classes))
@@ -149,6 +208,22 @@ class StackedEnsemble:
             y_tr_xg       = y_xg[tr_idx]  # encoded for XGB/LGBM
             y_tr_raw      = y[tr_idx]      # raw for RF
             y_val_raw     = y[val_idx]
+
+            # ── SMOTE inside fold (no leakage) ────────────────
+            # Synthetic samples are generated only from this fold's
+            # training split, so no validation-period information
+            # can bleed into the oversampled training set.
+            try:
+                from imblearn.over_sampling import SMOTE
+                k = min(5, min(np.bincount(y_tr_xg + 1)) - 1)
+                if k >= 1:
+                    smote         = SMOTE(random_state=42, k_neighbors=k)
+                    X_tr, y_tr_xg = smote.fit_resample(X_tr, y_tr_xg)
+                    y_tr_raw      = self._dec(y_tr_xg)
+            except ImportError:
+                pass   # imblearn not installed — train on imbalanced data
+            except Exception as _e:
+                logger.debug(f"SMOTE skipped fold {fold}: {_e}")
 
             # XGBoost (needs encoded labels)
             xgb = self._make_xgb()
@@ -224,16 +299,16 @@ class StackedEnsemble:
             y_tr_raw    = y[tr_idx]
 
             _x = self._make_xgb();  _x.fit(X_tr, y_tr_xg)
-            oof_xgb[val_idx]  = _x.predict_proba(X_val)
+            oof_xgb[val_idx]  = _x.predict_proba(X_val)[:, :n_classes]
 
             _l = self._make_lgbm(); _l.fit(X_tr, y_tr_xg)
-            oof_lgbm[val_idx] = _l.predict_proba(X_val)
+            oof_lgbm[val_idx] = _l.predict_proba(X_val)[:, :n_classes]
 
             _r = self._make_rf();   _r.fit(X_tr, y_tr_raw)
-            oof_rf[val_idx]   = _r.predict_proba(X_val)
+            oof_rf[val_idx]   = _r.predict_proba(X_val)[:, :n_classes]
 
             _m = self._make_mlp();  _m.fit(X_tr, y_tr_xg)
-            oof_mlp[val_idx]  = _m.predict_proba(X_val)
+            oof_mlp[val_idx]  = _m.predict_proba(X_val)[:, :n_classes]
         
 
         # ── Stack OOF probs as meta-features ─────────────────

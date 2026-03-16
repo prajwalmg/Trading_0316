@@ -1,11 +1,19 @@
 """
 ================================================================
   data/pipeline.py
-  Multi-source data pipeline:
-    - Primary:   yfinance (Forex, Equities, Commodities)
-    - Secondary: Histdata CSV loader (Forex M1 backup)
-    - Caching:   local parquet cache to avoid re-downloading
-    - Validation: spike detection, gap filling, quality checks
+  Multi-source data pipeline with asset-class routing:
+
+  Routing priority (best → fallback):
+    Forex      →  OANDA v20 API   →  yfinance
+    Equity     →  Alpaca Data API →  yfinance
+    Crypto     →  Binance API     →  yfinance
+    Commodity  →  yfinance        (no free alternative)
+    Macro      →  FRED API        →  yfinance (^VIX, DX-Y.NYB)
+
+  All sources share the same parquet cache so switching sources
+  does not re-download data unnecessarily.
+
+  Secondary: Histdata CSV loader (Forex M1 backup)
 ================================================================
 """
 
@@ -183,30 +191,130 @@ def fetch_yfinance(
             return pd.read_parquet(cache)
         return pd.DataFrame()
 
+# ── Smart multi-source fetcher ────────────────────────────────
+
+def fetch_ohlcv(
+    ticker:    str,
+    interval:  str  = GRANULARITY,
+    days:      int  = 730,
+    use_cache: bool = True,
+) -> pd.DataFrame:
+    """
+    Fetch OHLCV for any ticker, routing to the best available
+    data source for that asset class.
+
+    Priority:
+      forex     → OANDA  → yfinance
+      equity    → Alpaca → yfinance
+      crypto    → Binance (always works, no key) → yfinance
+      commodity → yfinance
+
+    Results are cached to parquet regardless of which source
+    was used, so the same cache logic applies everywhere.
+    """
+    period     = _days_to_period(days)
+    cache_path = _cache_path(ticker, interval, period)
+
+    if use_cache and _cache_valid(cache_path):
+        df = pd.read_parquet(cache_path)
+        logger.debug(f"{ticker}: loaded from cache ({len(df)} bars)")
+        return df
+
+    asset_class = ASSET_CLASS.get(ticker, "equity")
+    df          = pd.DataFrame()
+
+    # ── Route to best source ──────────────────────────────────
+    if asset_class == "forex":
+        try:
+            from data.sources.oanda import fetch_oanda
+            df = fetch_oanda(ticker, interval=interval, days=days)
+        except Exception as e:
+            logger.warning(f"{ticker}: OANDA failed ({e}) — trying yfinance")
+
+    elif asset_class == "equity":
+        try:
+            from data.sources.alpaca import fetch_alpaca
+            df = fetch_alpaca(ticker, interval=interval, days=days)
+        except Exception as e:
+            logger.warning(f"{ticker}: Alpaca failed ({e}) — trying yfinance")
+
+    elif asset_class == "crypto":
+        try:
+            from data.sources.binance import fetch_binance
+            df = fetch_binance(ticker, interval=interval, days=days)
+        except Exception as e:
+            logger.warning(f"{ticker}: Binance failed ({e}) — trying yfinance")
+
+    # Commodity always goes to yfinance (no free alternative)
+    # Any failed primary source also falls through to yfinance
+    if df.empty:
+        logger.info(f"{ticker}: falling back to yfinance")
+        df = fetch_yfinance(ticker, interval=interval, period=period,
+                            use_cache=False)   # cache handled below
+
+    if df.empty:
+        logger.error(f"{ticker}: all sources failed — no data")
+        return pd.DataFrame()
+
+    df = _validate_and_clean(df, ticker)
+    if not df.empty:
+        df.to_parquet(cache_path)
+
+    return df
+
+
+def _days_to_period(days: int) -> str:
+    """Convert a day count to the nearest yfinance period string."""
+    if days <= 7:    return "7d"
+    if days <= 30:   return "1mo"
+    if days <= 60:   return "60d"
+    if days <= 90:   return "3mo"
+    if days <= 180:  return "6mo"
+    if days <= 365:  return "1y"
+    if days <= 730:  return "2y"
+    return "max"
+
+
 def fetch_macro_context(use_cache: bool = True) -> dict:
     """
     Fetch VIX and DXY daily bars.
+
+    Primary source: FRED API (official, free, highly reliable)
+    Fallback:       yfinance (^VIX, DX-Y.NYB)
+
     Returns dict with keys 'vix' and 'dxy' as pd.Series of close prices.
     """
-    macro = {}
+    # ── Try FRED first ────────────────────────────────────────
+    try:
+        from data.sources.fred import fetch_fred
+        vix = fetch_fred("vix", days=730)
+        dxy = fetch_fred("dxy", days=730)
+
+        if not vix.empty and not dxy.empty:
+            logger.info(f"Macro context loaded from FRED "
+                        f"(VIX: {len(vix)} bars, DXY: {len(dxy)} bars)")
+            return {"vix": vix, "dxy": dxy}
+    except Exception as e:
+        logger.warning(f"FRED macro fetch failed ({e}) — falling back to yfinance")
+
+    # ── Fallback: yfinance ────────────────────────────────────
+    macro   = {}
     tickers = {"vix": "^VIX", "dxy": "DX-Y.NYB"}
-    
+
     for name, ticker in tickers.items():
         try:
-            df = fetch_yfinance(
-                ticker, interval="1d", period="730d",
-                use_cache=use_cache
-            )
+            df = fetch_yfinance(ticker, interval="1d", period="730d",
+                                use_cache=use_cache)
             if not df.empty:
                 macro[name] = df["close"]
-                logger.info(f"Macro {name}: {len(df)} daily bars loaded")
+                logger.info(f"Macro {name}: {len(df)} daily bars (yfinance fallback)")
             else:
                 macro[name] = None
                 logger.warning(f"Macro {name}: no data returned")
         except Exception as e:
             macro[name] = None
-            logger.warning(f"Macro {name}: fetch failed — {e}")
-    
+            logger.warning(f"Macro {name}: yfinance fallback failed — {e}")
+
     return macro
 
 def update_intraday_cache(pair: str, yf_ticker: str, is_crypto: bool = False) -> pd.DataFrame:
@@ -351,7 +459,7 @@ class DataPipeline:
         self,
         tickers:  list = None,
         interval: str  = GRANULARITY,
-        period:   str  = LOOKBACK_PERIOD,
+        days:     int  = 730,
         use_cache: bool = True,
     ) -> dict:
         """
@@ -362,10 +470,12 @@ class DataPipeline:
         failed  = []
 
         for ticker in tickers:
-            from config.settings import DATA_PERIODS, ASSET_CLASS_MAP
-            asset_class  = ASSET_CLASS_MAP.get(ticker, "equity")
-            data_period  = DATA_PERIODS.get(asset_class, period)
-            df = fetch_yfinance(ticker, interval=interval, period=data_period, use_cache=use_cache)
+            from config.settings import ASSET_CLASS_MAP
+            asset_class = ASSET_CLASS_MAP.get(ticker, "equity")
+            data_days   = {"forex": 730, "equity": 730,
+                           "commodity": 730, "crypto": 730}.get(asset_class, days)
+            df = fetch_ohlcv(ticker, interval=interval,
+                             days=data_days, use_cache=use_cache)
 
             if df.empty:
                 failed.append(ticker)

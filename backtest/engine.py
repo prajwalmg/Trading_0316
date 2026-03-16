@@ -175,3 +175,157 @@ def run_backtest_single(
         f"WR={metrics['win_rate']}"
     )
     return {"metrics": metrics, "equity": eq_series, "trades": trades_df}
+
+
+# ── Walk-Forward Backtest ──────────────────────────────────────
+
+def run_walkforward_backtest(
+    df_raw:      pd.DataFrame,
+    train_bars:  int   = 1080,   # ~45 days of 1h bars
+    test_bars:   int   = 240,    # ~10 days of 1h bars
+    capital:     float = INITIAL_CAPITAL,
+    min_conf:    float = MIN_CONFIDENCE,
+    swing:       bool  = False,
+) -> dict:
+    """
+    Rolling walk-forward backtest: retrain the ensemble on each
+    train window, then simulate forward on the next test window.
+
+    This is the honest backtest — each out-of-sample segment is
+    predicted by a model that has never seen it.
+
+    Parameters
+    ----------
+    df_raw      : full raw OHLCV DataFrame
+    train_bars  : number of bars in each training window
+    test_bars   : number of bars in each out-of-sample test window
+    capital     : starting capital (carries forward across folds)
+    min_conf    : minimum ensemble confidence to take a trade
+
+    Returns
+    -------
+    dict with keys:
+      "metrics"       : aggregated metrics over all OOS periods
+      "equity"        : full equity curve (pd.Series)
+      "trades"        : all OOS trades (pd.DataFrame)
+      "fold_metrics"  : per-fold metrics list
+      "fold_count"    : number of folds completed
+    """
+    from signals.ensemble import StackedEnsemble
+    from signals.features import get_X_y
+
+    all_trades:  list = []
+    equity_vals: list = []
+    equity_idx:  list = []
+    fold_metrics: list = []
+    nav          = capital
+    n            = len(df_raw)
+    fold         = 0
+
+    logger.info(
+        f"Walk-forward backtest | "
+        f"bars={n} | train={train_bars} | test={test_bars} | "
+        f"expected_folds={(n - train_bars) // test_bars}"
+    )
+
+    start = 0
+    while start + train_bars + test_bars <= n:
+        train_df = df_raw.iloc[start : start + train_bars]
+        test_df  = df_raw.iloc[start + train_bars : start + train_bars + test_bars]
+
+        # ── Train on this window ──────────────────────────────
+        X_tr, y_tr, _ = get_X_y(train_df, swing=swing)
+        if len(X_tr) < 100:
+            logger.warning(f"Fold {fold}: insufficient training samples ({len(X_tr)}) — skipping")
+            start += test_bars
+            continue
+
+        model = StackedEnsemble(instrument=f"wf_fold_{fold}")
+        try:
+            model.train(X_tr, y_tr)
+        except Exception as e:
+            logger.error(f"Fold {fold}: training failed — {e}")
+            start += test_bars
+            continue
+
+        # ── Simulate on out-of-sample test window ────────────
+        result = run_backtest_single(
+            test_df, model,
+            capital=nav,
+            min_conf=min_conf,
+            swing=swing,
+        )
+
+        if result["trades"].empty:
+            logger.info(f"Fold {fold}: no trades in OOS window")
+            start += test_bars
+            fold  += 1
+            continue
+
+        fold_trades = result["trades"].copy()
+        fold_trades["fold"] = fold
+        all_trades.append(fold_trades)
+
+        # Carry NAV forward into the next fold
+        if not result["equity"].empty:
+            nav = float(result["equity"].iloc[-1])
+            equity_vals.extend(result["equity"].tolist())
+            equity_idx.extend(result["equity"].index.tolist())
+
+        m = result["metrics"]
+        fold_metrics.append({
+            "fold":          fold,
+            "train_start":   train_df.index[0],
+            "train_end":     train_df.index[-1],
+            "test_start":    test_df.index[0],
+            "test_end":      test_df.index[-1],
+            "trades":        m.get("total_trades", 0),
+            "sharpe":        m.get("sharpe_ratio", 0),
+            "max_dd":        m.get("max_drawdown", "0%"),
+            "win_rate":      m.get("win_rate", "0%"),
+            "total_return":  m.get("total_return", "0%"),
+        })
+
+        logger.info(
+            f"Fold {fold} OOS | "
+            f"trades={m.get('total_trades',0)} | "
+            f"Sharpe={m.get('sharpe_ratio',0)} | "
+            f"DD={m.get('max_drawdown','?')} | "
+            f"WR={m.get('win_rate','?')}"
+        )
+
+        # Anchored: keep growing the training window each fold
+        # (change to start += test_bars for rolling window)
+        start += test_bars
+        fold  += 1
+
+    if not all_trades:
+        logger.warning("Walk-forward: no trades generated across all folds")
+        return {
+            "metrics":      {},
+            "equity":       pd.Series(dtype=float),
+            "trades":       pd.DataFrame(),
+            "fold_metrics": fold_metrics,
+            "fold_count":   fold,
+        }
+
+    trades_df = pd.concat(all_trades, ignore_index=True)
+    eq_series = pd.Series(equity_vals, index=equity_idx)
+
+    metrics = compute_metrics(eq_series, trades_df)
+    metrics["fold_count"] = fold
+
+    logger.info(
+        f"Walk-forward complete | {fold} folds | "
+        f"Sharpe={metrics['sharpe_ratio']} | "
+        f"DD={metrics['max_drawdown']} | "
+        f"trades={metrics['total_trades']}"
+    )
+
+    return {
+        "metrics":      metrics,
+        "equity":       eq_series,
+        "trades":       trades_df,
+        "fold_metrics": fold_metrics,
+        "fold_count":   fold,
+    }

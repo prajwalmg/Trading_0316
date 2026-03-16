@@ -261,8 +261,9 @@ class PortfolioManager:
 
     def should_execute(
         self,
-        signal_dict: dict,
-        df:          pd.DataFrame,
+        signal_dict:    dict,
+        df:             pd.DataFrame,
+        open_positions: list = None,
     ) -> tuple:
         """
         Final check before sending to broker.
@@ -325,7 +326,9 @@ class PortfolioManager:
         sizing["direction"] = signal
 
         # Correlation-adjusted sizing
-        open_pos       = self.broker.get_open_positions()
+        # open_positions is passed in by the caller (broker.get_open_positions())
+        # so PortfolioManager does not need a direct broker reference
+        open_pos       = open_positions if open_positions is not None else []
         adjusted_units = self.risk.correlation_adjusted_size(
             ticker, sizing["units"], open_pos
         )

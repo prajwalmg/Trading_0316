@@ -192,6 +192,17 @@ OANDA_API_KEY    = "YOUR_KEY"
 OANDA_ACCOUNT_ID = "YOUR_ACCOUNT"
 OANDA_ENV        = "practice"
 
+# ── DATA SOURCES ─────────────────────────────────────────────
+# FRED API key — free, takes < 2 min to get:
+#   https://fred.stlouisfed.org/docs/api/api_key.html
+# Used for: VIX, yield curve (10Y-2Y), Fed Funds Rate, Dollar Index
+FRED_API_KEY     = "YOUR_FRED_KEY"
+
+# Data source routing — which source to try first per asset class.
+# "auto"  = use the best available source (recommended)
+# "yfinance" = force yfinance for everything (original behaviour)
+DATA_SOURCE_MODE = "auto"
+
 SLIPPAGE_BPS     = 2                # 2 basis points slippage model
 COMMISSION_BPS   = 1                # 1 basis point commission
 

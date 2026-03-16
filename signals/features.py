@@ -619,16 +619,15 @@ def build_features(
         df   = df.dropna(subset=cols)
 
 
-    # Add at the end of build_features, before return df:
-
-    # ── Clip extreme feature values ───────────────────────────
-    # Prevents unbounded features from dominating the meta-learner
+    # ── Clip extreme feature values (no-lookahead) ───────────
+    # Uses expanding-window mean/std so each bar's clip bounds
+    # are computed from past data only — no future leakage.
     for col in FEATURE_COLS:
         if col in df.columns:
-            # Clip to 5 standard deviations
-            mean = df[col].mean()
-            std  = df[col].std() + 1e-9
-            df[col] = df[col].clip(mean - 5*std, mean + 5*std)
+            roll_mean = df[col].expanding(min_periods=50).mean()
+            roll_std  = df[col].expanding(min_periods=50).std().fillna(1.0) + 1e-9
+            df[col]   = df[col].clip(roll_mean - 5 * roll_std,
+                                     roll_mean + 5 * roll_std)
 
     return df
 
@@ -672,25 +671,10 @@ def get_X_y(
     if len(X) < 100:
         return np.array([]), np.array([]), df_feat
 
-    # ── Balance classes using SMOTE ───────────────────────────
-    try:
-        from imblearn.over_sampling import SMOTE
-        smote = SMOTE(random_state=42, k_neighbors=min(5, len(X)//10))
-        X, y  = smote.fit_resample(X, y)
-    except ImportError:
-        classes, counts = np.unique(y, return_counts=True)
-        max_count       = counts.max()
-        X_list, y_list  = [X], [y]
-        for cls, count in zip(classes, counts):
-            if count < max_count:
-                idx        = np.where(y == cls)[0]
-                oversample = np.random.choice(idx, max_count - count)
-                X_list.append(X[oversample])
-                y_list.append(y[oversample])
-        X = np.vstack(X_list)
-        y = np.concatenate(y_list)
-    except Exception as e:
-        logger.warning(f"SMOTE failed — {e}, using imbalanced data")
+    # NOTE: class balancing (SMOTE) is intentionally NOT applied here.
+    # Applying SMOTE before cross-validation would let synthetic samples
+    # generated from validation-period data leak into training folds.
+    # SMOTE is applied inside each CV fold in StackedEnsemble.train().
 
     return X, y, df_feat
 

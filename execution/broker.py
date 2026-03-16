@@ -33,11 +33,11 @@ from config.settings import (
 logger = logging.getLogger("trading_firm.execution")
 
 
-def calibration_report(self) -> dict:
+def calibration_report() -> dict:
     """
     Check if model confidence matches actual win rate.
     Run weekly to tune confidence thresholds.
-    
+
     If 60-70% confidence bucket shows only 45% win rate
     → raise threshold to 65%.
     If 60-70% shows 70% win rate → lower threshold to 55%.
