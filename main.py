@@ -237,6 +237,24 @@ def run_backtest(instruments: list, capital: float):
 # ══════════════════════════════════════════════════════════════
 
 def run_paper(instruments: list, capital: float, poll_seconds: int = 60):
+    # ── Runtime overrides (auto-tuned MIN_CONFIDENCE, etc.) ────
+    import json as _json
+    _overrides_path = "config/runtime_overrides.json"
+    if os.path.exists(_overrides_path):
+        try:
+            with open(_overrides_path) as _f:
+                _ov = _json.load(_f)
+            import config.settings as _cfg
+            for _k, _v in _ov.items():
+                if hasattr(_cfg, _k):
+                    setattr(_cfg, _k, _v)
+                    logger.info(f"Runtime override applied: {_k}={_v}")
+        except Exception as _e:
+            logger.warning(f"Could not load runtime overrides: {_e}")
+
+    from utils.alerts import alert_startup
+    alert_startup()
+
     dash      = Dashboard()
     dash.render_startup()
     time.sleep(2)
@@ -433,6 +451,22 @@ def run_paper(instruments: list, capital: float, poll_seconds: int = 60):
                     resp = broker.market_order(ticker, units, sl, tp)
                     logger.info(f"Order sent: {ticker} | {resp}")
 
+                    # Telegram alert
+                    try:
+                        from utils.alerts import alert_trade_opened
+                        alert_trade_opened(
+                            ticker     = ticker,
+                            direction  = direction,
+                            units      = sizing["units"],
+                            entry      = sizing["entry"],
+                            sl         = sl or 0.0,
+                            tp         = tp or 0.0,
+                            confidence = ml_conf,
+                            strategy   = agg.get("regime", ""),
+                        )
+                    except Exception:
+                        pass
+
                     # Increment daily trade counter
                     daily_trade_count[day_key] = daily_trade_count.get(day_key, 0) + 1
 
@@ -483,6 +517,40 @@ def run_paper(instruments: list, capital: float, poll_seconds: int = 60):
             # Log trades to CSV after each cycle
             if isinstance(broker, PaperBroker) and not broker.trade_log.empty:
                 broker.trade_log.to_csv("logs/paper_trades.csv", index=False)
+
+            # ── Daily HTML report (every 24 cycles) ────────────────
+            if cycle % 24 == 0:
+                try:
+                    from utils.report import generate_daily_report
+                    generate_daily_report(
+                        risk_engine   = risk,
+                        trade_history = broker.trade_log if isinstance(broker, PaperBroker) else pd.DataFrame(),
+                        open_positions = broker.get_open_positions(),
+                        instruments   = list(models.keys()),
+                    )
+                except Exception as _re:
+                    logger.debug(f"Daily report skipped: {_re}")
+
+                # ── Daily summary Telegram alert ─────────────────────
+                try:
+                    from utils.alerts import alert_daily_summary
+                    _rpt = risk.report()
+                    _th  = broker.trade_log if isinstance(broker, PaperBroker) else pd.DataFrame()
+                    _wr  = 0.0
+                    if not _th.empty and "pnl" in _th.columns:
+                        _wr = (_th["pnl"] > 0).mean()
+                    _dd_str = _rpt.get("drawdown", "0%").replace("%", "")
+                    _dd_val = float(_dd_str) / 100 if _dd_str else 0.0
+                    alert_daily_summary(
+                        nav           = _rpt["nav"],
+                        daily_pnl     = _rpt["daily_pnl"],
+                        daily_pnl_pct = _rpt["daily_pnl"] / max(_rpt["nav"], 1),
+                        n_trades      = _rpt["total_trades"],
+                        win_rate      = _wr,
+                        max_dd        = _dd_val,
+                    )
+                except Exception:
+                    pass
 
 
             # ── Periodic rebalance ─────────────────────────────

@@ -417,6 +417,15 @@ class RiskEngine:
             if daily_loss_pct >= MAX_DAILY_LOSS_PCT:
                 self.daily_halted = True
                 logger.warning(f"Daily loss limit hit: {daily_loss_pct:.2%}")
+                try:
+                    from utils.alerts import alert_circuit_breaker
+                    alert_circuit_breaker(
+                        reason    = f"Daily loss {daily_loss_pct:.2%} ≥ limit {MAX_DAILY_LOSS_PCT:.2%}",
+                        nav       = self.nav,
+                        daily_pnl = self.daily_pnl,
+                    )
+                except Exception:
+                    pass
                 return False, f"Daily loss {daily_loss_pct:.2%} ≥ {MAX_DAILY_LOSS_PCT:.2%}"
 
         # 3. Weekly loss

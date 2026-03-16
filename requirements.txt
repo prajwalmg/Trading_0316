@@ -35,9 +35,24 @@ python-dateutil>=2.8.0
 pytz>=2023.3
 tqdm>=4.66.0
 
+# ── Portfolio optimisation ────────────────────────────────────
+cvxpy>=1.4.0               # Mean-variance portfolio optimisation (Prompt 6)
+
+# ── Deep learning (optional — LSTM 5th base model) ───────────
+# torch>=2.1.0             # PyTorch — install separately for your platform:
+#   CPU:  pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu
+#   CUDA: pip install torch torchvision (auto-selects GPU build)
+# If not installed, LSTM falls back gracefully to neutral probabilities.
+
+# ── Alerts ───────────────────────────────────────────────────
+# Telegram: no extra package needed — uses stdlib urllib.request
+# Set env vars: TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID
+
 # ── Install order ─────────────────────────────────────────────
 # pip install --upgrade pip
 # pip install pandas numpy pyarrow yfinance
 # pip install scikit-learn xgboost lightgbm imbalanced-learn
 # pip install requests alpaca-trade-api
 # pip install python-dateutil pytz tqdm
+# pip install cvxpy
+# pip install torch torchvision --index-url https://download.pytorch.org/whl/cpu

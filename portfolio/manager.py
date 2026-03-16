@@ -25,6 +25,8 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
+from risk.portfolio_optimizer import optimise_weights, estimate_covariance
+
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config.settings import (
@@ -333,6 +335,48 @@ class PortfolioManager:
             ticker, sizing["units"], open_pos
         )
         sizing["units"] = adjusted_units
+
+        # ── Portfolio optimisation weight adjustment ───────────────
+        # Build a simple 1-asset optimisation to get the MV-optimal
+        # allocation weight for this instrument, then scale units.
+        try:
+            all_tickers = (
+                list(FOREX_PAIRS) + list(EQUITY_TICKERS) + list(COMMODITY_TICKERS)
+            )
+            n = max(len(all_tickers), 1)
+
+            # Use identity covariance as placeholder when we don't yet
+            # have a cross-asset returns DataFrame available at this point.
+            cov = estimate_covariance(None) if n == 1 else np.eye(n) * 0.0001
+
+            mu = np.full(n, 0.0001)   # flat prior — equal expected return
+
+            opt_weights = optimise_weights(
+                tickers          = all_tickers,
+                expected_returns = mu,
+                cov_matrix       = cov,
+                risk_aversion    = 1.0,
+                max_weight       = 0.40,
+            )
+
+            equal_weight = 1.0 / n
+            this_weight  = opt_weights.get(ticker, equal_weight)
+
+            # Scale units proportionally: if optimizer says 20% vs 10% equal,
+            # double the units; if 5% vs 10%, halve them.
+            weight_scale = this_weight / (equal_weight + 1e-9)
+            weight_scale = float(np.clip(weight_scale, 0.5, 2.0))   # ±2× cap
+
+            sizing["units"]          = int(round(sizing["units"] * weight_scale))
+            sizing["opt_weight"]     = round(this_weight, 6)
+            sizing["weight_scale"]   = round(weight_scale, 4)
+
+            logger.debug(
+                f"{ticker}: opt_weight={this_weight:.4f} "
+                f"scale={weight_scale:.3f} units={sizing['units']}"
+            )
+        except Exception as e:
+            logger.debug(f"Portfolio optimisation skipped for {ticker}: {e}")
 
         return True, "OK", sizing
 
