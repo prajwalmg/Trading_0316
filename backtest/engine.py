@@ -19,8 +19,38 @@ from config.settings import (
     INITIAL_CAPITAL, GRANULARITY,
 )
 from signals.features import build_features, FEATURE_COLS, SWING_FEATURE_COLS
+try:
+    from signals.features_intraday import build_features_intraday, INTRADAY_FEATURE_COLS
+except ImportError:
+    build_features_intraday = None
+    INTRADAY_FEATURE_COLS = []
 
 logger = logging.getLogger("trading_firm.backtest")
+
+# Realistic round-trip spread in pips for forex pairs.
+# Non-forex instruments (equities, crypto, commodities) pay only
+# SLIPPAGE_BPS + COMMISSION_BPS — no pip spread added.
+_FOREX_SPREAD_PIPS: dict = {
+    # Majors
+    "EURUSD=X": 0.5, "GBPUSD=X": 0.6, "USDJPY=X": 0.6, "USDCHF=X": 0.8,
+    "AUDUSD=X": 0.7, "NZDUSD=X": 0.9, "USDCAD=X": 0.8,
+    # EUR crosses
+    "EURGBP=X": 1.0, "EURJPY=X": 1.0, "EURCHF=X": 1.2, "EURAUD=X": 1.5,
+    "EURCAD=X": 1.3, "EURNZD=X": 2.0,
+    # GBP crosses
+    "GBPJPY=X": 1.5, "GBPCHF=X": 1.8, "GBPAUD=X": 2.0, "GBPCAD=X": 2.0,
+    "GBPNZD=X": 2.5,
+    # AUD/NZD crosses
+    "AUDJPY=X": 1.2, "AUDCHF=X": 1.5, "AUDCAD=X": 1.5, "AUDNZD=X": 1.8,
+    "NZDJPY=X": 1.5, "NZDCHF=X": 2.0, "NZDCAD=X": 2.0,
+    # CAD/CHF crosses
+    "CADJPY=X": 1.3, "CADCHF=X": 1.5, "CHFJPY=X": 1.5,
+    # Exotics (wide spreads)
+    "USDNOK=X": 5.0, "USDSEK=X": 5.0, "USDDKK=X": 5.0, "USDSGD=X": 4.0,
+    "USDHKD=X": 3.0, "USDMXN=X": 8.0, "USDTRY=X": 15.0, "USDZAR=X": 10.0,
+    "USDPLN=X": 5.0, "USDCZK=X": 6.0, "USDHUF=X": 6.0, "USDCNH=X": 5.0,
+}
+_DEFAULT_FOREX_SPREAD_PIPS = 1.5   # fallback for unknown =X pairs
 
 BARS_PER_YEAR = {
     "1m": 525_600, "5m": 105_120, "15m": 35_040,
@@ -77,37 +107,104 @@ def compute_metrics(equity: pd.Series, trades: pd.DataFrame) -> dict:
 
 
 def run_backtest_single(
-    df_raw:    pd.DataFrame,
+    df_raw:         pd.DataFrame,
     model,
-    capital:   float = INITIAL_CAPITAL,
-    min_conf:  float = MIN_CONFIDENCE,
-    swing:     bool  = False,
+    capital:        float = INITIAL_CAPITAL,
+    min_conf:       float = MIN_CONFIDENCE,
+    swing:          bool  = False,
+    ticker:         str   = "",
+    regime_tracker        = None,   # signals.regime.RegimeTracker (optional)
+    use_circuit_breaker: bool  = False,   # whether to apply monthly DD limit (mirrors live trading logic)
 ) -> dict:
-    df_feat = build_features(df_raw, add_labels=False, drop_na=True, swing=swing)
+    # Detect intraday model — use the right feature builder
+    _is_intraday = getattr(model, "_intraday", False)
+    if _is_intraday and build_features_intraday is not None:
+        df_feat = build_features_intraday(df_raw, add_labels=False, drop_na=True)
+    else:
+        df_feat = build_features(df_raw, add_labels=False, drop_na=True, swing=swing)
     if df_feat.empty:
         return {"metrics": {}, "equity": pd.Series(), "trades": pd.DataFrame()}
 
-    active_cols = SWING_FEATURE_COLS if swing else FEATURE_COLS
+    # Use model's PRE-SELECTION feature list (_full_feature_cols) so the
+    # RobustScaler (fit on the full feature set) receives the correct number
+    # of columns.  selected_features_ is applied internally by predict_proba.
+    _fc = (getattr(model, "_full_feature_cols", None)
+           or getattr(model, "_feature_cols", None)
+           or [])
+    if _fc:
+        active_cols = [c for c in _fc if c in df_feat.columns]
+    else:
+        active_cols = SWING_FEATURE_COLS if swing else FEATURE_COLS
+    if not active_cols:
+        active_cols = SWING_FEATURE_COLS if swing else FEATURE_COLS
     X           = df_feat[active_cols].values
     sigs, confs, _ = model.predict_with_confidence(X)
 
     cost_rate = (SLIPPAGE_BPS + COMMISSION_BPS) / 10_000
 
-    # Add realistic forex spread for intraday (1.5 pips)
-    # Only apply for forex — equities already have commission modelled
-    avg_price    = float(df_feat["close"].mean())
-    spread_pips  = 1.5
-    pip_size     = 0.0001 if avg_price < 10 else 0.01
-    spread_cost  = (spread_pips * pip_size) / avg_price
-    cost_rate    = cost_rate + spread_cost
+    # Add realistic forex spread — only for FX pairs (ticker ends with =X)
+    if ticker.endswith("=X"):
+        avg_price   = float(df_feat["close"].mean())
+        spread_pips = _FOREX_SPREAD_PIPS.get(ticker, _DEFAULT_FOREX_SPREAD_PIPS)
+        pip_size    = 0.01 if avg_price > 20 else 0.0001   # JPY pairs use 0.01
+        cost_rate  += (spread_pips * pip_size) / avg_price
 
+    # Pre-compute per-bar regime labels using the fold-specific HMM
+    regime_series = None
+    if regime_tracker is not None and ticker:
+        try:
+            regime_series = regime_tracker.predict_states(df_feat, ticker)
+        except Exception:
+            regime_series = None
 
-    trades   = []
-    equity   = [capital]
-    nav      = capital
-    i        = 0
+    trades      = []
+    equity      = [capital]
+    nav         = capital
+    # ── Monthly-reset circuit breaker (mirrors live trading logic) ──
+    # Track DD within each calendar month. When the month rolls over,
+    # the peak resets — identical to RiskEngine.check_session_drawdown().
+    SESSION_DD_LIMIT  = 0.05
+    _cb_peak_nav      = capital
+    _cb_month         = None          # (year, month) of current window
+    halted_months: set = set()        # months where DD limit was hit
+    halted_bar    = None              # first bar ever halted (for reporting)
+    i             = 0
 
     while i < len(df_feat) - 1:
+        # ── Monthly circuit breaker ───────────────────────────
+        bar_ts = df_feat.index[i]
+        try:
+            bar_month = (bar_ts.year, bar_ts.month)
+        except AttributeError:
+            bar_month = None
+
+        if bar_month != _cb_month:
+            # New calendar month — reset peak for this month
+            _cb_month    = bar_month
+            _cb_peak_nav = nav
+
+        if nav > _cb_peak_nav:
+            _cb_peak_nav = nav
+
+        if use_circuit_breaker and bar_month in halted_months:
+            # This month already hit the DD limit — sit out rest of month
+            equity.append(nav)
+            i += 1
+            continue
+
+        cb_dd = (_cb_peak_nav - nav) / (_cb_peak_nav + 1e-9)
+        if use_circuit_breaker and cb_dd >= SESSION_DD_LIMIT:
+            halted_months.add(bar_month)
+            if halted_bar is None:
+                halted_bar = i
+            logger.warning(
+                f"Monthly circuit breaker fired at bar {i} "
+                f"(month={bar_month}, DD={cb_dd:.1%})"
+            )
+            equity.append(nav)
+            i += 1
+            continue
+
         sig  = int(sigs[i])
         conf = float(confs[i])
 
@@ -116,13 +213,36 @@ def run_backtest_single(
             i += 1
             continue
 
+        # HMM regime filter: skip trade if high_volatility + low confidence
+        if regime_series is not None:
+            bar_regime = regime_series.iloc[i] if i < len(regime_series) else "ranging"
+            if bar_regime == "high_volatility" and conf < 0.65:
+                equity.append(nav)
+                i += 1
+                continue
+
         entry = float(df_feat["close"].iloc[i])
         atr   = float(df_feat["atr"].iloc[i]) if "atr" in df_feat.columns else entry * 0.001
         sl    = entry - sig * atr * SL_ATR_MULT
         tp    = entry + sig * atr * TP_ATR_MULT
 
-        risk_amt  = nav * MAX_RISK_PCT
+        # HMM vol-forecast position scaling
+        vol_scale = 1.0
+        if regime_tracker is not None and ticker:
+            vf = regime_tracker.get_vol_forecast(ticker)
+            if vf > 0.40:   vol_scale = 0.50
+            elif vf > 0.25: vol_scale = 0.75
+
+        # Confidence scalar: scales units 0.5x→1.5x based on how far conf
+        # exceeds the minimum threshold (layer 1 of adaptive sizing)
+        conf_above  = conf - min_conf
+        conf_range  = 1.0 - min_conf
+        conf_scalar = 0.5 + (conf_above / (conf_range + 1e-9)) * 1.0
+        conf_scalar = max(0.5, min(1.5, conf_scalar))
+
+        risk_amt  = nav * MAX_RISK_PCT * vol_scale
         units     = risk_amt / (atr * SL_ATR_MULT + 1e-9)
+        units     = units * conf_scalar
         pos_val   = min(units * entry, nav * 5)
 
         exit_price = None
@@ -167,12 +287,15 @@ def run_backtest_single(
     )
     trades_df = pd.DataFrame(trades)
     metrics   = compute_metrics(eq_series, trades_df)
+    if halted_bar is not None:
+        metrics["halted_at_bar"] = halted_bar
 
     logger.info(
         f"Backtest: {len(trades_df)} trades | "
         f"Sharpe={metrics['sharpe_ratio']} | "
         f"DD={metrics['max_drawdown']} | "
         f"WR={metrics['win_rate']}"
+        + (f" | HALTED bar {halted_bar}" if halted_bar is not None else "")
     )
     return {"metrics": metrics, "equity": eq_series, "trades": trades_df}
 
@@ -186,6 +309,7 @@ def run_walkforward_backtest(
     capital:     float = INITIAL_CAPITAL,
     min_conf:    float = MIN_CONFIDENCE,
     swing:       bool  = False,
+    ticker:      str   = "",
 ) -> dict:
     """
     Rolling walk-forward backtest: retrain the ensemble on each
@@ -213,6 +337,7 @@ def run_walkforward_backtest(
     """
     from signals.ensemble import StackedEnsemble
     from signals.features import get_X_y
+    from signals.regime import RegimeTracker
 
     all_trades:  list = []
     equity_vals: list = []
@@ -248,12 +373,18 @@ def run_walkforward_backtest(
             start += test_bars
             continue
 
+        # ── Train per-fold HMM on training window (no lookahead) ─
+        fold_regime = RegimeTracker()
+        fold_regime.train_on(ticker, train_df)
+
         # ── Simulate on out-of-sample test window ────────────
         result = run_backtest_single(
             test_df, model,
             capital=nav,
             min_conf=min_conf,
             swing=swing,
+            ticker=ticker,
+            regime_tracker=fold_regime,
         )
 
         if result["trades"].empty:
@@ -284,6 +415,7 @@ def run_walkforward_backtest(
             "max_dd":        m.get("max_drawdown", "0%"),
             "win_rate":      m.get("win_rate", "0%"),
             "total_return":  m.get("total_return", "0%"),
+            "halted_at_bar": m.get("halted_at_bar", None),
         })
 
         logger.info(

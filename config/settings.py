@@ -4,23 +4,45 @@
 ================================================================
 """
 
+import os
+
 ENV             = "paper"
 BASE_CURRENCY   = "EUR"
-INITIAL_CAPITAL = 1_000.0
+INITIAL_CAPITAL = 10_000.0
+
+# ── Twelve Data ───────────────────────────────────────────────
+TWELVE_DATA_API_KEY = os.getenv("TWELVE_DATA_API_KEY", "")
+TWELVE_DATA_PLAN    = os.getenv("TWELVE_DATA_PLAN", "free")
+# free plan  : 8 req/min,     800 credits/day, ~5 000 bars/request
+# grow plan  : 60 req/min, 50 000 credits/day, ~50 000 bars/request
+# pro plan   : 120 req/min, unlimited credits
+
+#FRED_API_KEY = "aab3e4e47326cc5548e1614b135643ab"
+FMP_API_KEY        = "iPsIBee0pikODSBhCGdprLW6xRGjpk9B"
+MASSIVE_API_KEY    = "QL2Glfc5RNbCfeapS9jyokG4tH8T45hj"
+FINNHUB_API_KEY    = "d75bmqpr01qk56kc5s10d75bmqpr01qk56kc5s1g"
+FRED_API_KEY       = "aab3e4e47326cc5548e1614b135643ab"
+EDGAR_IDENTITY     = "Prajwal M mgprajwal13@gmail.com"
+QUESTDB_HOST       = "localhost"
+QUESTDB_PORT       = 8812
 
 # ── IBKR ─────────────────────────────────────────────────────
 IBKR_HOST      = "127.0.0.1"
 IBKR_PORT      = 7497       # 7497=paper | 7496=live
 IBKR_CLIENT_ID = 10
 
+# Telegram (for trade alerts and system notifications)
+TELEGRAM_BOT_TOKEN = "8735513793:AAHHPDvtFYqRWf53MgMew0lGLROZp4jOp0g"
+TELEGRAM_CHAT_ID   = "601840484"
+
 # ══════════════════════════════════════════════════════════════
 #  FOREX  (46 pairs — all free on IBKR IDEALPRO)
 # ══════════════════════════════════════════════════════════════
 
 FOREX_PAIRS = [
-    # USD Majors
-    "EURUSD=X", "GBPUSD=X", "USDJPY=X", "USDCHF=X",
-    "AUDUSD=X", "NZDUSD=X", "USDCAD=X",
+    # USD Majors (USDCHF and NZDUSD excluded — no valid confidence threshold found in sweep)
+    "EURUSD=X", "GBPUSD=X", "USDJPY=X",
+    "AUDUSD=X", "USDCAD=X",
 
     # USD Minors / Exotics
     "USDNOK=X", "USDSEK=X", "USDDKK=X", "USDSGD=X",
@@ -153,8 +175,26 @@ MLPC_PARAMS = {"hidden_layer_sizes":(128,64,32),"activation":"relu",
     "max_iter":500,"early_stopping":True,"validation_fraction":0.1,
     "random_state":42,"verbose":False}
 
-MIN_CONFIDENCE          = 0.60
+MIN_CONFIDENCE          = 0.58
 MIN_BARS_BETWEEN_TRADES = 0
+
+# Per-instrument confidence overrides (fallback: MIN_CONFIDENCE)
+# Thresholds selected by confidence sweep (70/30 split, criteria: max Sharpe
+# with trades >= 30 and PF >= 1.0).  USDCHF and NZDUSD excluded — no valid
+# threshold found in sweep (all Sharpe < 0 or trades < 30).
+INSTRUMENT_MIN_CONFIDENCE = {
+    "EURUSD=X": 0.57,   # Sharpe 2.730 | 172 trades | PF 1.641
+    "GBPUSD=X": 0.55,   # WF sweep: best thresh=0.55, WF Sharpe 0.978
+    "USDJPY=X": 0.60,   # Sharpe 1.060 |  77 trades | PF 1.316
+    "AUDUSD=X": 0.55,   # Sharpe 1.653 | 222 trades | PF 1.261
+    "USDCAD=X": 0.57,   # Sharpe 3.355 |  50 trades | PF 4.186
+    "GBPJPY=X": 0.57,   # lowered from 0.60 to allow 57.9%+ conf signals through
+    "EURJPY=X": 0.62,   # WF sweep: best thresh=0.62, WF Sharpe 1.452
+    "EURGBP=X": 0.60,   # Sharpe 1.341 |  33 trades | PF 1.864
+}
+
+# Instruments permanently excluded from swing trading (no valid WF threshold)
+SWING_EXCLUDED_INSTRUMENTS: set = {"NZDUSD=X", "USDCHF=X"}
 
 # ── Risk ──────────────────────────────────────────────────────
 MAX_RISK_PCT          = 0.01
@@ -166,7 +206,7 @@ MAX_CORRELATED_TRADES = 2
 MAX_SINGLE_EXPOSURE   = 0.15
 MAX_HOLD_BARS         = 24
 SL_ATR_MULT    = 1.5
-TP_ATR_MULT    = 2.5
+TP_ATR_MULT    = 1.5
 TRAILING_STOP  = True
 TRAIL_ATR_MULT = 1.0
 KELLY_FRACTION = 0.5

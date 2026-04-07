@@ -218,7 +218,7 @@ def walk_forward_backtest(
         wf_model = StackedEnsemble(instrument=f"{pair}_wf_{i}")
         wf_model.train(X_tr, y_tr)
 
-        result = run_backtest_single(df_test, wf_model, INITIAL_CAPITAL)
+        result = run_backtest_single(df_test, wf_model, INITIAL_CAPITAL, ticker=pair)
         pf     = result["metrics"].get("profit_factor", 0)
         wr     = result["metrics"].get("win_rate", 0)
         dd     = result["metrics"].get("max_drawdown", 0)
@@ -291,7 +291,7 @@ def run_backtest():
             model = StackedEnsemble(instrument=f"{pair}_{MODEL_SUFFIX}")
             model.train(X_tr, y_tr)
 
-        result = run_backtest_single(df_test, model, INITIAL_CAPITAL)
+        result = run_backtest_single(df_test, model, INITIAL_CAPITAL, ticker=pair)
         all_results[pair] = result
 
         print(f"\n{'─'*50}")

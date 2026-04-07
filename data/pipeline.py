@@ -8,10 +8,13 @@
   Equities    : 12 tickers (US + EU, yfinance fallback)
   Commodities :  6 instruments
 
-  Data source logic:
-    IBKR Gateway (live)  →  primary for ALL assets
-    yfinance             →  fallback + long training history
-    Local parquet cache  →  offline & rate-limit protection
+  Data source logic (training_mode=True):
+    Twelve Data (primary — up to 5yr history) →
+    IBKR Gateway → yfinance → local parquet cache
+
+  Data source logic (training_mode=False / live):
+    IBKR Gateway (live prices) →
+    Twelve Data → yfinance → local parquet cache
 
   IBKR pacing rules respected:
     0.5s gap between requests
@@ -39,7 +42,11 @@ from config.settings import (
     ASSET_CLASS_MAP, GRANULARITY, MIN_BARS, DATA_CACHE_DIR,
     FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS, CRYPTO_TICKERS,
     IBKR_HOST, IBKR_PORT, IBKR_CLIENT_ID,
+    TWELVE_DATA_API_KEY, TWELVE_DATA_PLAN,
 )
+
+# Twelve Data outputsize: free plan caps at 5000; paid plans support 50000
+_TD_OUTPUTSIZE = 50_000 if TWELVE_DATA_PLAN in ("grow", "pro") else 5_000
 
 logger = logging.getLogger("trading_firm.data")
 
@@ -258,14 +265,25 @@ def _get_ibkr():
                     if rid in self._pq: self._pq[rid].put((tt,price))
                 def tickSnapshotEnd(self,rid):
                     if rid in self._pq: self._pq[rid].put((-1,-1))
-            app=App()
-            app.connect(IBKR_HOST,IBKR_PORT,IBKR_CLIENT_ID+1)
-            threading.Thread(target=app.run,daemon=True).start()
-            for _ in range(50):
-                if app._connected: break
-                time.sleep(0.1)
+            for attempt in range(5):
+                try:
+                    app=App()
+                    app.connect(IBKR_HOST,IBKR_PORT,IBKR_CLIENT_ID+1)
+                    threading.Thread(target=app.run,daemon=True).start()
+                    for _ in range(50):
+                        if app._connected: break
+                        time.sleep(0.1)
+                    if app._connected:
+                        break
+                except Exception as e:
+                    logger.warning(f"IBKR connect attempt {attempt+1}/5: {e}")
+                    time.sleep(10 * (attempt + 1))
+            else:
+                # All attempts exhausted
+                _ibkr_app = "offline"
+                logger.warning("IBKR unavailable — yfinance fallback active")
+                return None
             if not app._connected:
-                # Mark as offline — no more retries or warnings this session
                 _ibkr_app = "offline"
                 logger.info("IB Gateway offline → yfinance fallback active for this session")
                 return None
@@ -358,23 +376,109 @@ def _fetch_yf(ticker, interval="1h"):
         logger.error(f"{ticker}: yfinance — {e}"); return pd.DataFrame()
 
 
+# ── Twelve Data helper (lazy singleton) ───────────────────────
+_td_client = None
+
+def _get_td_client():
+    global _td_client
+    if _td_client is None and TWELVE_DATA_API_KEY:
+        try:
+            from data.twelvedata import TwelveDataClient
+            _td_client = TwelveDataClient(
+                api_key=TWELVE_DATA_API_KEY,
+                # free: 8/min; grow: 60/min; pro: 120/min
+                max_per_minute={"free": 8, "grow": 60, "pro": 120}.get(
+                    TWELVE_DATA_PLAN, 8
+                ),
+            )
+        except Exception as e:
+            logger.warning(f"TwelveData client init failed: {e}")
+    return _td_client
+
+
+def _fetch_td(ticker, interval="1h", training_mode=False):
+    """Fetch via Twelve Data. Returns empty DataFrame if unavailable."""
+    client = _get_td_client()
+    if client is None:
+        return pd.DataFrame()
+    try:
+        df = client.fetch_ohlcv(
+            symbol=ticker,
+            interval=interval,
+            outputsize=_TD_OUTPUTSIZE,
+            use_cache=True,
+            training_mode=training_mode,
+        )
+        return df if not df.empty else pd.DataFrame()
+    except Exception as e:
+        logger.warning(f"{ticker}: TwelveData error — {e}")
+        return pd.DataFrame()
+
+
 # ── Public API ─────────────────────────────────────────────────
-def fetch_ohlcv(ticker, interval=GRANULARITY, days=365,
+def fetch_ohlcv(ticker, interval=GRANULARITY, days=1825,
                 use_cache=True, training_mode=False):
-    ttl=CACHE_TTL_TRAIN if training_mode else CACHE_TTL_LIVE
-    cache=_cache_path(ticker,interval)
-    if use_cache and _cache_valid(cache,ttl):
-        df=_load(cache)
-        if not df.empty: return df
-    df=_fetch_ibkr(ticker,interval)
-    if df.empty: df=_fetch_yf(ticker,interval)
+    ttl   = CACHE_TTL_TRAIN if training_mode else CACHE_TTL_LIVE
+    cache = _cache_path(ticker, interval)
+
+    if use_cache and _cache_valid(cache, ttl):
+        df = _load(cache)
+        # Short-cache eviction: yfinance only fetches ~2yr so a valid-TTL
+        # cache may block the Dukascopy 5yr fetch permanently.  Evict it.
+        if training_mode and _is_forex(ticker) and len(df) < 20000:
+            os.remove(cache)
+            logger.info(f"{ticker}: short cache removed "
+                        f"({len(df)} bars) — "
+                        f"forcing Dukascopy refetch")
+        elif not df.empty:
+            return df
+
+    if training_mode:
+        # Training: Dukascopy first (5yr cached) → Twelve Data → IBKR → yfinance
+        df = pd.DataFrame()
+        try:
+            from data.dukascopy import fetch_5yr
+            from config.settings import FOREX_PAIRS
+            if ticker in FOREX_PAIRS:
+                df = fetch_5yr(ticker, interval=interval)
+                if not df.empty:
+                    logger.info(f"{ticker}: Dukascopy "
+                                f"{len(df)} bars")
+        except Exception as e:
+            logger.warning(f"Dukascopy failed: {e}")
+        if df.empty:
+            df = _fetch_td(ticker, interval, training_mode=True)
+        if df.empty:
+            df = _fetch_ibkr(ticker, interval)
+        if df.empty:
+            df = _fetch_yf(ticker, interval)
+    else:
+        # Live: prefer IBKR (real-time) → FMP (forex) → yfinance
+        df = _fetch_ibkr(ticker, interval)
+        if df.empty and ticker.endswith('=X'):
+            # FMP for forex pairs (EURUSD=X → EURUSD)
+            fmp_sym = ticker.replace('=X', '')
+            try:
+                from data.fmp import FMPClient
+                _fmp = FMPClient()
+                df = _fmp.get_ohlcv(fmp_sym, '1hour', years=2)
+                if not df.empty:
+                    logger.info(f"{ticker}: FMP fetch — {len(df)} bars")
+            except Exception as _e:
+                logger.warning(f"{ticker}: FMP failed ({_e}) — yfinance fallback")
+                df = pd.DataFrame()
+        if df.empty:
+            df = _fetch_yf(ticker, interval)
+
     if df.empty:
         if os.path.exists(cache):
-            logger.warning(f"{ticker}: stale cache fallback")
+            logger.warning(f"{ticker}: all sources failed — stale cache fallback")
             return _load(cache)
         return pd.DataFrame()
-    df=_clean(df,ticker)
-    if not df.empty: _save(df,cache)
+
+    df = _clean(df, ticker)
+    if not df.empty:
+        _save(df, cache)
     return df
 
 
@@ -424,7 +528,7 @@ def check_data_sources():
 class DataPipeline:
     def __init__(self): self._store:Dict[str,pd.DataFrame]={}
 
-    def refresh_all(self,tickers=None,interval=GRANULARITY,days=365,
+    def refresh_all(self,tickers=None,interval=GRANULARITY,days=1825,
                     use_cache=True,training_mode=False):
         tickers=tickers or(FOREX_PAIRS+EQUITY_TICKERS+COMMODITY_TICKERS+CRYPTO_TICKERS)
         failed=[]
@@ -483,4 +587,36 @@ def load_histdata_csv(path_pattern,resample_to="5min"):
     if resample_to and resample_to!="1min":
         df=df.resample(resample_to).agg({"open":"first","high":"max",
             "low":"min","close":"last","volume":"sum"}).dropna()
+    return df
+
+def _is_forex(ticker: str) -> bool:
+    try:
+        from config.settings import FOREX_PAIRS
+        return ticker in FOREX_PAIRS
+    except Exception:
+        return "=X" in ticker
+
+
+def get_intraday_5m(ticker: str, max_bars: int = None) -> pd.DataFrame:
+    """
+    Load 5m Dukascopy parquet for the given ticker.
+    Returns all available data by default (max_bars=None).
+    Pass max_bars to cap for memory-constrained inference loops.
+    """
+    import glob
+    SYMBOL_MAP_5M = {
+        "EURUSD=X": "EURUSD", "GBPUSD=X": "GBPUSD",
+        "EURJPY=X": "EURJPY", "GBPJPY=X": "GBPJPY",
+        "AUDUSD=X": "AUDUSD", "USDCAD=X": "USDCAD",
+        "EURGBP=X": "EURGBP", "USDJPY=X": "USDJPY",
+    }
+    sym     = SYMBOL_MAP_5M.get(ticker, ticker.replace("=X", ""))
+    pattern = f"data/cache/dukascopy/{sym}_5m_*.parquet"
+    files   = glob.glob(pattern)
+    if not files:
+        return pd.DataFrame()
+    largest = max(files, key=os.path.getsize)
+    df = pd.read_parquet(largest)
+    if max_bars is not None and len(df) > max_bars:
+        df = df.iloc[-max_bars:]
     return df

@@ -78,6 +78,15 @@ class RiskEngine:
         self.weekly_halted  = False
         self.drawdown_halted = False
 
+        # Intra-session (monthly) drawdown circuit breaker
+        self._session_peak_nav   = initial_capital
+        self._session_start_nav  = initial_capital
+        self.SESSION_DD_LIMIT    = 0.05   # 5% session drawdown
+        self._session_month      = None   # tracks current month for reset
+
+        # Per-instrument PnL history for adaptive sizing (Lever 4)
+        self._instrument_pnl: dict = {}
+
         logger.info(
             f"RiskEngine initialised | "
             f"capital={initial_capital:.2f} | "
@@ -106,7 +115,29 @@ class RiskEngine:
             new_sl = current_price + (trail_mult * atr)
             return min(new_sl, current_sl)
 
+    def record_trade_pnl(self, instrument: str, pnl: float) -> None:
+        """Record closed-trade PnL for adaptive sizing (layer 2/3)."""
+        hist = self._instrument_pnl.setdefault(instrument, [])
+        hist.append(pnl)
+        if len(hist) > 20:
+            hist.pop(0)
 
+    def _get_adaptive_size_multiplier(self, instrument: str) -> float:
+        """
+        Layer 2: recent per-instrument win-streak / loss-streak scaling.
+        - 3+ consecutive wins  → 1.2x
+        - 3+ consecutive losses → 0.7x
+        - otherwise             → 1.0x
+        """
+        hist = self._instrument_pnl.get(instrument, [])
+        if len(hist) < 3:
+            return 1.0
+        last3 = hist[-3:]
+        if all(p > 0 for p in last3):
+            return 1.2
+        if all(p < 0 for p in last3):
+            return 0.7
+        return 1.0
 
     def portfolio_momentum_score(self, signals: dict) -> float:
         """
@@ -153,6 +184,37 @@ class RiskEngine:
                 f"(limit={MAX_DRAWDOWN_PCT:.2%}). ALL trading suspended."
             )
 
+    # ── Session drawdown circuit breaker ─────────────────────
+
+    def check_session_drawdown(self) -> bool:
+        """
+        Checks intra-session (monthly) drawdown.
+        Resets session peak at the start of each new calendar month.
+        Returns True if session DD limit is hit (halt trading),
+        False otherwise.
+        """
+        now = datetime.now(timezone.utc)
+        current_month = (now.year, now.month)
+
+        # Monthly reset
+        if self._session_month != current_month:
+            self._session_month    = current_month
+            self._session_peak_nav = self.nav
+            self._session_start_nav = self.nav
+            logger.info(f"Session DD reset — new month {now.strftime('%Y-%m')}")
+
+        # Update peak
+        if self.nav > self._session_peak_nav:
+            self._session_peak_nav = self.nav
+
+        dd = (self._session_peak_nav - self.nav) / (self._session_peak_nav + 1e-9)
+        if dd >= self.SESSION_DD_LIMIT:
+            logger.warning(
+                f"Session drawdown {dd:.1%} >= {self.SESSION_DD_LIMIT:.0%} limit — halting cycle"
+            )
+            return True
+        return False
+
     # ── Kelly criterion ───────────────────────────────────────
 
     def kelly_fraction(self) -> float:
@@ -186,21 +248,35 @@ class RiskEngine:
 
     def position_size(
         self,
-        instrument: str,
-        entry:      float,
-        atr:        float,
-        confidence: float,
-        regime:     str = "ranging",
-    ) -> dict:
+        instrument:    str,
+        entry:         float,
+        atr:           float,
+        confidence:    float,
+        regime:        str   = "ranging",
+        vol_forecast:  float = 0.0,
+        in_transition: bool  = False,
+    ) -> dict | None:
         """
         Calculate position size using:
         - Base risk from MAX_RISK_PCT
         - Regime multiplier (trend = bigger, ranging = smaller)
         - Confidence multiplier (higher confidence = bigger)
         - Kelly fraction
-        - Portfolio momentum boost
+        - Volatility forecast scaling (from GMMHMM emission)
+        - Transition penalty (uncertain regime → half size)
+        - Skip if high_volatility + confidence < 0.65
+
+        Returns None if the trade should be skipped entirely.
         """
         from config.settings import MAX_RISK_PCT, KELLY_FRACTION
+
+        # ── Regime + vol guard (HMM-specific filters) ─────────────
+        if regime == "high_volatility" and confidence < 0.65:
+            logger.info(
+                f"{instrument}: skipped — high_volatility regime + "
+                f"conf={confidence:.2%} < 0.65"
+            )
+            return None
 
         from config.settings import ASSET_RISK_PCT, ASSET_CLASS_MAP, ASSET_ATR_MULTIPLIER
         asset_class = ASSET_CLASS_MAP.get(instrument) or \
@@ -234,8 +310,30 @@ class RiskEngine:
         conf_mult = 0.5 + float(confidence)   # 0.5 at 0%, 1.5 at 100%
         conf_mult = max(0.5, min(conf_mult, 1.5))
 
+        # ── HMM vol-forecast scaling ──────────────────────────────
+        if vol_forecast > 0.40:
+            vol_scale = 0.50    # high vol → half size
+        elif vol_forecast > 0.25:
+            vol_scale = 0.75    # elevated vol → 3/4 size
+        else:
+            vol_scale = 1.00
+
+        # ── Transition penalty ────────────────────────────────────
+        transition_scale = 0.50 if in_transition else 1.00
+
         # ── Kelly fraction ────────────────────────────────────────
-        risk = base_risk * regime_mult * conf_mult * KELLY_FRACTION
+        risk = base_risk * regime_mult * conf_mult * KELLY_FRACTION * vol_scale * transition_scale
+
+        # ── Macro regime overlay (FRED) ───────────────────────────
+        try:
+            from data.macro import get_macro_regime_score
+            _macro_score = get_macro_regime_score()
+            if _macro_score < -0.5:    # risk-off regime
+                risk *= 0.75
+            elif _macro_score > 0.5:   # risk-on regime
+                risk *= 1.10
+        except Exception:
+            pass
 
         # ── Hard cap at 3x base risk ──────────────────────────────
         risk = min(risk, base_risk * 3.0)

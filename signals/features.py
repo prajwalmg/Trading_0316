@@ -22,6 +22,17 @@ def _safe_div(a, b, fill=0.0):
     return a.div(b.replace(0, np.nan)).fillna(fill)
 
 
+def _rsi(series: pd.Series, period: int = 14) -> pd.Series:
+    """Wilder RSI on a price series."""
+    delta    = series.diff()
+    gain     = delta.clip(lower=0)
+    loss     = (-delta).clip(lower=0)
+    avg_gain = gain.ewm(com=period - 1, adjust=False).mean()
+    avg_loss = loss.ewm(com=period - 1, adjust=False).mean()
+    rs       = avg_gain / avg_loss.replace(0, 1e-9)
+    return 100 - (100 / (1 + rs))
+
+
 # ── Individual feature families ───────────────────────────────
 
 def add_trend(df: pd.DataFrame) -> pd.DataFrame:
@@ -565,7 +576,15 @@ FEATURE_COLS = [
 
     # Alternative sentiment
     "fg_norm", "fg_contrarian",
+
+    # COT institutional positioning (weekly, forward-filled)
+    "cot_nc_z", "cot_comm_z",
+    "cot_nc_extreme_long", "cot_nc_extreme_short",
+
 ]
+# Note: FRED macro features (macro_fed_funds_z, etc.) were removed from FEATURE_COLS.
+# Daily-frequency macro signals add noise at 1h prediction intervals.
+# Macro regime is still used in risk/engine.py for position sizing overlay.
 
 
 def build_features(
@@ -577,9 +596,12 @@ def build_features(
     fg_norm:      float = None,
     fg_contrarian: float = None,
     sl_mult:      float = 1.5,
-    tp_mult:      float = 2.0,
-    forward_bars: int   = 12,
+    tp_mult:      float = 1.5,
+    forward_bars: int   = 20,
     swing:        bool  = False,
+    ticker:       str   = "",
+    df_4h:        pd.DataFrame = None,
+    df_1d:        pd.DataFrame = None,
 ) -> pd.DataFrame:
     """
     Full feature pipeline. Returns enriched DataFrame.
@@ -611,6 +633,35 @@ def build_features(
     df = add_htf_context(df)
     df = add_macro_context(df, vix=vix, dxy=dxy)
 
+    # ── FRED macro features ───────────────────────────────────
+    try:
+        from data.macro import enrich_features as _macro_enrich
+        df = _macro_enrich(df)
+    except Exception:
+        for _mc in [
+            "macro_fed_funds_z", "macro_yield_curve_z", "macro_credit_z",
+            "macro_vix_z", "macro_unemployment_z", "macro_cpi_yoy_z",
+            "macro_regime_score",
+        ]:
+            if _mc not in df.columns:
+                df[_mc] = 0.0
+
+    # ── COT institutional positioning ─────────────────────────
+    _cot_cols = ["cot_nc_z", "cot_comm_z", "cot_nc_extreme_long", "cot_nc_extreme_short"]
+    if ticker:
+        try:
+            from data.cot import get_cot_features as _cot_enrich
+            df = _cot_enrich(ticker, df)
+        except Exception as _e:
+            logger.warning(f"COT features failed: {_e}")
+            for _c in _cot_cols:
+                if _c not in df.columns:
+                    df[_c] = 0.0
+    else:
+        for _c in _cot_cols:
+            if _c not in df.columns:
+                df[_c] = 0.0
+
     # ── Alternative data: Fear & Greed ───────────────────────
     # If caller supplies live scalars, broadcast them as constant columns.
     # During backtesting these default to 0 (neutral) — no lookahead.
@@ -619,6 +670,12 @@ def build_features(
 
     if swing:
         df = add_swing_features(df)
+
+    # Append HTF features if higher-TF data provided
+    if df_4h is not None or df_1d is not None:
+        htf = build_htf_features(df, df_4h=df_4h, df_1d=df_1d)
+        for col in htf.columns:
+            df[col] = htf[col].values
 
     if add_labels:
         df = add_labels_col(df, forward_bars=forward_bars,
@@ -646,11 +703,12 @@ def build_features(
 def get_X_y(
     df:           pd.DataFrame,
     sl_mult:      float = 1.5,
-    tp_mult:      float = 2.0,
-    forward_bars: int   = 12,
+    tp_mult:      float = 1.5,
+    forward_bars: int   = 20,
     vix:          pd.Series = None,
     dxy:          pd.Series = None,
     swing:        bool  = False,
+    ticker:       str   = "",
 ) -> tuple:
     """
     Build feature matrix and labels.
@@ -665,6 +723,7 @@ def get_X_y(
         forward_bars=forward_bars,
         vix=vix, dxy=dxy,
         swing=swing,
+        ticker=ticker,
     )
     if df_feat.empty:
         return np.array([]), np.array([]), df_feat
@@ -746,4 +805,222 @@ SWING_FEATURE_COLS = FEATURE_COLS + [
     "mtf_align", "vol_regime",
 ]
 
+HTF_FEATURE_COLS = [
+    # Daily (7)
+    "d_ema50", "d_ema200", "d_adx", "d_rsi", "d_bb_pct", "d_atr_ratio", "d_vol_regime",
+    # 4H (6)
+    "h4_trend", "h4_macd_hist", "h4_rsi", "h4_bb_pct", "h4_ema_cross", "h4_momentum",
+    # Cross-TF (5)
+    "tf_alignment", "tf_strength", "htf_rsi_div", "volatility_regime", "trend_consistency",
+]
+
+
+def build_htf_features(df_1h: pd.DataFrame, df_4h: pd.DataFrame = None, df_1d: pd.DataFrame = None) -> pd.DataFrame:
+    """Compute 18 HTF feature columns aligned to 1h index.
+
+    Uses merge_asof (backward fill) — no lookahead bias.
+    Returns DataFrame with HTF_FEATURE_COLS columns, indexed like df_1h.
+    All columns default to 0.0 if higher-TF data is unavailable.
+    """
+    idx = df_1h.index
+    result = pd.DataFrame(0.0, index=idx, columns=HTF_FEATURE_COLS)
+
+    # ── Daily features ──────────────────────────────────────────────────
+    if df_1d is not None and not df_1d.empty and len(df_1d) >= 20:
+        d = df_1d.copy()
+        d["d_ema50"]   = d["close"].ewm(span=50, adjust=False).mean()
+        d["d_ema200"]  = d["close"].ewm(span=200, adjust=False).mean()
+
+        # ADX
+        high, low, close = d["high"], d["low"], d["close"]
+        tr   = pd.concat([high - low, (high - close.shift()).abs(), (low - close.shift()).abs()], axis=1).max(axis=1)
+        atr14 = tr.rolling(14).mean()
+        dm_pos = (high - high.shift()).clip(lower=0)
+        dm_neg = (low.shift() - low).clip(lower=0)
+        di_pos = 100 * dm_pos.rolling(14).mean() / atr14.replace(0, 1e-9)
+        di_neg = 100 * dm_neg.rolling(14).mean() / atr14.replace(0, 1e-9)
+        dx     = (100 * (di_pos - di_neg).abs() / (di_pos + di_neg).replace(0, 1e-9)).rolling(14).mean()
+        d["d_adx"] = dx
+
+        d["d_rsi"] = _rsi(d["close"], 14)
+
+        # Bollinger %B
+        sma20 = d["close"].rolling(20).mean()
+        std20 = d["close"].rolling(20).std()
+        d["d_bb_pct"] = (d["close"] - (sma20 - 2 * std20)) / (4 * std20.replace(0, 1e-9))
+
+        # ATR ratio (current ATR vs 50-bar ATR)
+        atr_short = atr14
+        atr_long  = tr.rolling(50).mean()
+        d["d_atr_ratio"] = atr_short / atr_long.replace(0, 1e-9)
+
+        # Volume regime: current vol vs 20-bar avg
+        if "volume" in d.columns:
+            vol_avg = d["volume"].rolling(20).mean().replace(0, 1e-9)
+            d["d_vol_regime"] = (d["volume"] / vol_avg).clip(0, 5)
+        else:
+            d["d_vol_regime"] = 1.0
+
+        htf_1d = d[["d_ema50", "d_ema200", "d_adx", "d_rsi", "d_bb_pct", "d_atr_ratio", "d_vol_regime"]].dropna()
+        if not htf_1d.empty:
+            df_1h_reset = pd.DataFrame(index=idx)
+            merged = pd.merge_asof(
+                df_1h_reset.reset_index().rename(columns={df_1h_reset.index.name or "index": "ts"}),
+                htf_1d.reset_index().rename(columns={htf_1d.index.name or "index": "ts"}),
+                on="ts", direction="backward"
+            ).set_index("ts")
+            for col in ["d_ema50", "d_ema200", "d_adx", "d_rsi", "d_bb_pct", "d_atr_ratio", "d_vol_regime"]:
+                if col in merged.columns:
+                    result[col] = merged[col].values
+
+    # ── 4H features ─────────────────────────────────────────────────────
+    if df_4h is not None and not df_4h.empty and len(df_4h) >= 20:
+        h = df_4h.copy()
+
+        # Trend: slope of EMA20 normalised by price
+        ema20 = h["close"].ewm(span=20, adjust=False).mean()
+        h["h4_trend"] = (ema20 - ema20.shift(5)) / ema20.shift(5).replace(0, 1e-9)
+
+        # MACD histogram
+        ema12 = h["close"].ewm(span=12, adjust=False).mean()
+        ema26 = h["close"].ewm(span=26, adjust=False).mean()
+        macd  = ema12 - ema26
+        sig   = macd.ewm(span=9, adjust=False).mean()
+        h["h4_macd_hist"] = (macd - sig) / h["close"].replace(0, 1e-9)
+
+        h["h4_rsi"] = _rsi(h["close"], 14)
+
+        sma20 = h["close"].rolling(20).mean()
+        std20 = h["close"].rolling(20).std()
+        h["h4_bb_pct"] = (h["close"] - (sma20 - 2 * std20)) / (4 * std20.replace(0, 1e-9))
+
+        ema8  = h["close"].ewm(span=8,  adjust=False).mean()
+        ema21 = h["close"].ewm(span=21, adjust=False).mean()
+        h["h4_ema_cross"] = (ema8 - ema21) / h["close"].replace(0, 1e-9)
+
+        h["h4_momentum"] = h["close"].pct_change(10)
+
+        htf_4h = h[["h4_trend", "h4_macd_hist", "h4_rsi", "h4_bb_pct", "h4_ema_cross", "h4_momentum"]].dropna()
+        if not htf_4h.empty:
+            df_1h_reset = pd.DataFrame(index=idx)
+            merged = pd.merge_asof(
+                df_1h_reset.reset_index().rename(columns={df_1h_reset.index.name or "index": "ts"}),
+                htf_4h.reset_index().rename(columns={htf_4h.index.name or "index": "ts"}),
+                on="ts", direction="backward"
+            ).set_index("ts")
+            for col in ["h4_trend", "h4_macd_hist", "h4_rsi", "h4_bb_pct", "h4_ema_cross", "h4_momentum"]:
+                if col in merged.columns:
+                    result[col] = merged[col].values
+
+    # ── Cross-TF features ────────────────────────────────────────────────
+    if df_4h is not None and not df_4h.empty and df_1d is not None and not df_1d.empty:
+        # TF alignment: are 1h, 4H, 1D all trending same direction?
+        ema20_1h = df_1h["close"].ewm(span=20, adjust=False).mean()
+        trend_1h = (ema20_1h > ema20_1h.shift(5)).astype(float)
+
+        if "h4_trend" in result.columns:
+            trend_4h_series = result["h4_trend"].fillna(0)
+            trend_4h = (trend_4h_series > 0).astype(float)
+        else:
+            trend_4h = pd.Series(0.5, index=idx)
+
+        if "d_ema50" in result.columns and "d_ema200" in result.columns:
+            d_bull = (result["d_ema50"].fillna(0) > result["d_ema200"].fillna(0)).astype(float)
+        else:
+            d_bull = pd.Series(0.5, index=idx)
+
+        result["tf_alignment"]  = (trend_1h.values + trend_4h.values + d_bull.values) / 3.0
+        result["tf_strength"]   = (trend_1h.values * trend_4h.values).astype(float)
+
+        # HTF RSI divergence: 4H RSI vs 1H RSI direction
+        rsi_1h = _rsi(df_1h["close"], 14)
+        h4_rsi_series = result["h4_rsi"].fillna(50)
+        result["htf_rsi_div"]   = (h4_rsi_series.values - rsi_1h.values) / 100.0
+
+        # Volatility regime: 1H ATR vs 1D ATR
+        high_1h  = df_1h["high"]
+        low_1h   = df_1h["low"]
+        close_1h = df_1h["close"]
+        tr_1h = pd.concat(
+            [high_1h - low_1h,
+             (high_1h - close_1h.shift()).abs(),
+             (low_1h - close_1h.shift()).abs()], axis=1
+        ).max(axis=1)
+        atr_1h_14 = tr_1h.rolling(14).mean()
+        d_atr_ratio_series = result["d_atr_ratio"].fillna(1)
+        result["volatility_regime"] = (atr_1h_14 / close_1h.replace(0, 1e-9)).fillna(0) * d_atr_ratio_series
+
+        # Trend consistency: fraction of last 20 1h bars above EMA20
+        result["trend_consistency"] = (
+            (df_1h["close"] > ema20_1h).rolling(20).mean().fillna(0.5)
+        )
+
+    return result.fillna(0.0)
+
+
+# ================================================================
+# FUNDAMENTAL FEATURE COLUMNS (equity instruments only)
+# Appended after SWING_FEATURE_COLS when fundamental data available.
+# ================================================================
+
+FUNDAMENTAL_FEATURE_NAMES = [
+    "piotroski_f",        # 0–1 normalised Piotroski composite
+    "earnings_surprise",  # (actual EPS – estimate) / |estimate|, clipped ±3
+    "eps_revision_3m",    # analyst EPS revision over last quarter
+    "insider_buy_ratio",  # buys / (buys + sells), last 90 days
+    "pe_ratio",           # log-scaled P/E, normalised
+    "ps_ratio",           # log-scaled P/S, normalised
+    "pb_ratio",           # log-scaled P/B, normalised
+    "revenue_growth_yoy", # YoY revenue growth, clipped ±3
+    "net_margin",         # net income / revenue, clipped ±1
+    "debt_equity",        # total debt / equity, clipped 0–10
+    "price_vs_target",    # (price – analyst target) / target
+    "days_to_earnings",   # 0–1 scaled, 90-day horizon
+    "analyst_rating",     # strong sell=0.2 … strong buy=1.0
+    "roe",                # return on equity, clipped ±2
+    "roa",                # return on assets, clipped ±0.5
+    "current_ratio",      # current assets / liabilities (normalised)
+    "fcf_yield",          # FCF / market-cap proxy, clipped ±0.2
+    "revenue_surprise",   # (actual rev – est rev) / |est rev|, clipped ±3
+    "earnings_streak",    # consecutive quarterly EPS beats / 8
+]
+
+EQUITY_FEATURE_COLS = SWING_FEATURE_COLS + FUNDAMENTAL_FEATURE_NAMES
+
+
+# ================================================================
+# CROSS-SECTIONAL NORMALISATION UTILITY
+# ================================================================
+
+def normalize_cross_sectional(
+    df: pd.DataFrame,
+    cols: list,
+    sector_col: str = None,
+) -> pd.DataFrame:
+    """Z-score normalise columns cross-sectionally (within sector groups).
+
+    Args:
+        df:         DataFrame where each row is one instrument at one timestamp.
+        cols:       Columns to normalise.
+        sector_col: If given, normalise within each sector group; otherwise
+                    normalise across the full universe.
+
+    Returns:
+        Copy of df with the specified columns replaced by z-scores.
+    """
+    df = df.copy()
+    groups = df.groupby(sector_col) if (sector_col and sector_col in df.columns) else [(None, df)]
+
+    for _, grp in groups:
+        for col in cols:
+            if col not in df.columns:
+                continue
+            mu    = grp[col].mean()
+            sigma = grp[col].std()
+            if sigma > 1e-9:
+                df.loc[grp.index, col] = (df.loc[grp.index, col] - mu) / sigma
+            else:
+                df.loc[grp.index, col] = 0.0
+
+    return df
 

@@ -102,7 +102,8 @@ from config.settings import (
     XGB_PARAMS, LGBM_PARAMS, RF_PARAMS, MLPC_PARAMS,
     CV_SPLITS, MODEL_DIR, MIN_CONFIDENCE,
 )
-from signals.features import FEATURE_COLS, build_features, get_X_y
+from signals.features import (FEATURE_COLS, SWING_FEATURE_COLS, build_features, get_X_y,
+                               HTF_FEATURE_COLS)
 
 logger = logging.getLogger("trading_firm.ensemble")
 
@@ -123,16 +124,24 @@ class StackedEnsemble:
     _ENCODE_BINARY = {-1: 0, 1: 1}    # binary: no class 0
     _DECODE_BINARY = { 0: -1, 1: 1}   # binary back to signals
 
-    def __init__(self, instrument: str = "model"):
+    def __init__(self, instrument: str = "model", swing: bool = False):
         self.instrument   = instrument
         self.base_models  = {}
         self.meta_learner = None
+        # Adaptive per-class confidence thresholds (set during train())
+        self._long_threshold  = MIN_CONFIDENCE
+        self._short_threshold = MIN_CONFIDENCE
         self.scaler       = StandardScaler()
         self.classes_     = np.array([-1, 0, 1])
         self.is_trained   = False
         self._cv_metrics  = {}
         self.selected_features_ = None
         self.feature_scaler_ = None
+        # Record the feature mode used during training so inference always
+        # uses the exact same column list, even after save/load.
+        self._swing = swing
+        self._intraday = False           # set True when trained on INTRADAY_FEATURE_COLS
+        self._feature_cols: list = []   # populated by train()
 
     # ── Label helpers ────────────────────────────────────────
 
@@ -184,6 +193,43 @@ class StackedEnsemble:
         X : feature matrix (n_samples, n_features)
         y : labels [-1, 0, 1]
         """
+        # Stamp the exact feature list used so signal_for_latest_bar() and
+        # predict_proba() always apply the correct columns after save/load.
+        # Auto-detect swing vs intraday from actual X.shape[1] so this is
+        # robust regardless of how swing= was set on the constructor.
+        import os as _os
+        _os.environ.setdefault("LOKY_MAX_CPU_COUNT", "8")
+
+        _swing_htf = list(SWING_FEATURE_COLS) + list(HTF_FEATURE_COLS)
+        try:
+            from signals.features_intraday import INTRADAY_FEATURE_COLS as _IFC
+        except ImportError:
+            _IFC = []
+        if X.shape[1] == len(_swing_htf):
+            self._feature_cols = _swing_htf
+            self._swing = True
+            self._intraday = False
+        elif X.shape[1] == len(SWING_FEATURE_COLS):
+            self._feature_cols = list(SWING_FEATURE_COLS)
+            self._swing = True
+            self._intraday = False
+        elif X.shape[1] == len(FEATURE_COLS):
+            self._feature_cols = list(FEATURE_COLS)
+            self._swing = False
+            self._intraday = False
+        elif _IFC and X.shape[1] == len(_IFC):
+            self._feature_cols = list(_IFC)
+            self._swing = False
+            self._intraday = True
+        else:
+            # Fallback: generic names for arbitrary feature count
+            _base = list(SWING_FEATURE_COLS if self._swing else FEATURE_COLS)
+            if X.shape[1] > len(_base):
+                _base = _base + [f"feat_{i}" for i in range(X.shape[1] - len(_base))]
+            self._feature_cols = _base[:X.shape[1]]
+            self._intraday = False
+        self._full_feature_cols = list(self._feature_cols)  # save pre-selection list
+
         n    = len(X)
         y_xg = self._enc(y)   # encoded labels for XGBoost/LightGBM [0,1,2]
 
@@ -287,6 +333,8 @@ class StackedEnsemble:
         mask          = mask_thresh | mask_top40
 
         self.selected_features_ = np.where(mask)[0]
+        self._feature_cols = [self._feature_cols[i]
+                              for i in self.selected_features_]
         n_selected = len(self.selected_features_)
 
         logger.info(
@@ -304,7 +352,7 @@ class StackedEnsemble:
         oof_xgb  = np.zeros((n, n_classes))
         oof_lgbm = np.zeros((n, n_classes))
         oof_rf   = np.zeros((n, n_classes))
-        oof_mlp  = np.zeros((n, n_classes))     
+        oof_mlp  = np.zeros((n, n_classes))
 
         lstm_scores = []
         for fold, (tr_idx, val_idx) in enumerate(tscv.split(X)):
@@ -338,7 +386,7 @@ class StackedEnsemble:
                 oof_lstm[val_idx] = 1.0 / n_classes   # neutral fallback
 
         # ── Stack OOF probs as meta-features ─────────────────
-        meta_X = np.hstack([oof_xgb, oof_lgbm, oof_rf, oof_mlp, oof_lstm])  # (n, 15)
+        meta_X = np.hstack([oof_xgb, oof_lgbm, oof_rf, oof_mlp, oof_lstm])  # (n, 10)
         meta_X = self.scaler.fit_transform(meta_X)
 
         # Meta-learner uses raw [-1,0,1] labels
@@ -374,6 +422,9 @@ class StackedEnsemble:
 
         self.is_trained = True
 
+        # ── Compute signal bias on full training set ──────────
+        self._compute_signal_bias(X)
+
         lstm_mean = np.mean(lstm_scores) if lstm_scores else 0.0
         lstm_std  = np.std(lstm_scores)  if lstm_scores else 0.0
 
@@ -397,7 +448,92 @@ class StackedEnsemble:
         )
         return self._cv_metrics
 
+    # ── Signal bias correction ────────────────────────────────
+
+    def _compute_signal_bias(self, X_context: np.ndarray):
+        """
+        Compute rolling long/short base rate over last 500 training bars.
+        If long rate > 75% of all directional signals at conf>0.60,
+        raise the long threshold (+0.05) to filter extreme long bias.
+        The short threshold is never lowered — counter-trend shorts in
+        a bull-regime training window would generate regressions.
+
+        Thresholds are stored as attributes and used in
+        predict_with_confidence() and signal_for_latest_bar().
+        """
+        sample = X_context[-500:] if len(X_context) > 500 else X_context
+        try:
+            proba = self.predict_proba(sample)
+            classes = list(self.meta_learner.classes_)
+            if 1 not in classes or -1 not in classes:
+                return
+            long_idx  = classes.index(1)
+            short_idx = classes.index(-1)
+            long_rate  = float((proba[:, long_idx]  > 0.60).mean())
+            short_rate = float((proba[:, short_idx] > 0.60).mean())
+            total_rate = long_rate + short_rate
+
+            if total_rate > 0 and long_rate / (total_rate + 1e-9) > 0.75:
+                # Extreme long bias (>75%) — raise long bar only.
+                # Do NOT lower the short threshold: counter-trend shorts
+                # in a bull-regime training window cause regressions.
+                self._long_threshold  = MIN_CONFIDENCE + 0.05
+                self._short_threshold = MIN_CONFIDENCE
+                logger.info(
+                    f"[{self.instrument}] Signal bias correction: "
+                    f"long_rate={long_rate:.1%} → "
+                    f"long_thr={self._long_threshold:.2f} "
+                    f"(short_thr unchanged at {self._short_threshold:.2f})"
+                )
+            else:
+                self._long_threshold  = MIN_CONFIDENCE
+                self._short_threshold = MIN_CONFIDENCE
+        except Exception as e:
+            logger.debug(f"_compute_signal_bias failed: {e}")
+            self._long_threshold  = MIN_CONFIDENCE
+            self._short_threshold = MIN_CONFIDENCE
+
     # ── Prediction ────────────────────────────────────────────
+
+    def _pin_inference_threads(self):
+        """
+        Force n_jobs=1 on every base model that uses parallel workers.
+
+        Background: XGBoost, LightGBM, and RandomForest are all trained
+        with n_jobs=-1 (all cores).  That setting is pickled into the
+        model object.  On macOS (Darwin) PyTorch initialises its own
+        OpenMP/MKL thread pool during the first LSTM.predict_proba call.
+        When the *next* ticker's RF / LGBM inference tries to spawn new
+        loky/OpenMP worker processes via os.fork(), the child inherits
+        PyTorch's locked pthread mutexes and deadlocks — the process
+        hangs silently forever.
+
+        Setting n_jobs=1 tells joblib to run inference in the calling
+        thread (no fork), which is safe regardless of what PyTorch has
+        done.  Inference speed is negligible (<1 s for 5 000 rows) so
+        there is no practical cost to single-threading here.
+
+        This method is idempotent — safe to call multiple times.
+        """
+        for name, m in self.base_models.items():
+            if m is None:
+                continue
+            # RandomForest, ExtraTrees — sklearn n_jobs attribute
+            if hasattr(m, "n_jobs"):
+                m.n_jobs = 1
+            # LightGBM — stored in _other_params as well as top-level
+            if hasattr(m, "_other_params") and "n_jobs" in getattr(m, "_other_params", {}):
+                m._other_params["n_jobs"] = 1
+            # XGBoost — nthread / n_jobs
+            if hasattr(m, "get_params"):
+                try:
+                    params = m.get_params()
+                    if "n_jobs" in params:
+                        m.set_params(n_jobs=1)
+                    if "nthread" in params:
+                        m.set_params(nthread=1)
+                except Exception:
+                    pass
 
     def predict_proba(self, X: np.ndarray) -> np.ndarray:
         """
@@ -407,12 +543,16 @@ class StackedEnsemble:
         if not self.is_trained:
             raise RuntimeError("Model not trained. Call .train() first.")
 
+        # Guard against fork-after-torch deadlock on macOS:
+        # pin all parallel base models to n_jobs=1 before any inference.
+        self._pin_inference_threads()
+
         if self.feature_scaler_ is not None:
             X = self.feature_scaler_.transform(X)
 
         if self.selected_features_ is not None:
             X = X[:, self.selected_features_]
-        
+
         # XGBoost/LGBM return probs for [0,1,2] — order is preserved
         p_xgb  = self.base_models["xgb"].predict_proba(X)
         p_lgbm = self.base_models["lgbm"].predict_proba(X)
@@ -442,14 +582,39 @@ class StackedEnsemble:
         """
         Returns (signal_array, confidence_array, votes_dict).
         All signals are in [-1, 0, 1].
+
+        Applies per-class adaptive thresholds (set during train()) to
+        correct directional bias: if the model over-produces long signals,
+        it requires higher confidence for longs and accepts lower for shorts.
         """
         # predict_proba handles feature selection internally
         proba      = self.predict_proba(X)
         confidence = proba.max(axis=1)
-        signal     = self.meta_learner.classes_[proba.argmax(axis=1)]
+        raw_signal = self.meta_learner.classes_[proba.argmax(axis=1)]
 
-        # Apply selection once for individual model votes
-        X_sel = X[:, self.selected_features_] if self.selected_features_ is not None else X
+        # Retrieve adaptive thresholds (fall back to MIN_CONFIDENCE for old models)
+        long_thr  = getattr(self, "_long_threshold",  MIN_CONFIDENCE)
+        short_thr = getattr(self, "_short_threshold", MIN_CONFIDENCE)
+        classes   = list(self.meta_learner.classes_)
+
+        # Apply class-specific threshold: zero out signal if below its threshold
+        if long_thr != MIN_CONFIDENCE or short_thr != MIN_CONFIDENCE:
+            long_idx  = classes.index(1)  if 1  in classes else None
+            short_idx = classes.index(-1) if -1 in classes else None
+            signal = np.zeros(len(raw_signal), dtype=int)
+            for i, (sig, conf) in enumerate(zip(raw_signal, confidence)):
+                if sig == 1 and long_idx is not None and proba[i, long_idx] >= long_thr:
+                    signal[i] = 1
+                elif sig == -1 and short_idx is not None and proba[i, short_idx] >= short_thr:
+                    signal[i] = -1
+                # else: signal stays 0 (filtered out by bias correction)
+        else:
+            signal = raw_signal
+
+        # Apply the same scaler+selection used inside predict_proba so the
+        # individual model votes are computed on correctly preprocessed features.
+        X_sc  = self.feature_scaler_.transform(X) if self.feature_scaler_ is not None else X
+        X_sel = X_sc[:, self.selected_features_] if self.selected_features_ is not None else X_sc
 
         votes = {
             "xgb":  self._dec(self.base_models["xgb"].predict(X_sel)).tolist(),
@@ -461,15 +626,42 @@ class StackedEnsemble:
 
     def signal_for_latest_bar(self, df: pd.DataFrame) -> dict:
         """
-        Takes raw OHLCV DataFrame, returns signal dict for most recent bar.
-        Used by the live trading loop.
+        Takes a feature-enriched (or raw) DataFrame, returns signal dict for
+        the most recent bar.  Used by the live trading loop.
+
+        If df already has the feature columns (built by build_features() in the
+        caller with fg_norm/fg_contrarian etc.), those values are used as-is.
+        If df is raw OHLCV, build_features() is called internally (no F&G).
+
+        The correct feature column list (_feature_cols, set during train()) is
+        always used so swing-trained models get SWING_FEATURE_COLS and intraday
+        models get FEATURE_COLS without any manual flag at the call site.
         """
-        df_feat = build_features(df, add_labels=False, drop_na=True)
+        # predict_proba applies feature_scaler_ (fit on full feature set) then
+        # selects down to selected_features_.  Always pass the full pre-selection
+        # feature set here; _feature_cols (selected subset) is used only to
+        # verify the dataframe contains the required columns.
+        # Use _full_feature_cols (pre-selection list saved during train) when available
+        # so HTF-trained models correctly pass all feature columns at inference.
+        full_cols = (getattr(self, "_full_feature_cols", None)
+                     or (SWING_FEATURE_COLS if self._swing else FEATURE_COLS))
+        active_cols = self._feature_cols if self._feature_cols else full_cols
+
+        # If the caller already built features (all full_cols present), use
+        # the dataframe directly.  Otherwise build features from raw OHLCV.
+        if all(c in df.columns for c in full_cols):
+            df_feat = df
+        else:
+            df_feat = build_features(df, add_labels=False, drop_na=True,
+                                     swing=self._swing)
         if df_feat.empty:
             return {"signal": 0, "confidence": 0.0, "reason": "Insufficient data", "tradeable": False}
 
         latest = df_feat.iloc[[-1]]
-        X      = latest[FEATURE_COLS].values
+        # Extract only the columns present; missing HTF cols default to 0
+        avail = [c for c in full_cols if c in df_feat.columns]
+        row   = latest.reindex(columns=full_cols, fill_value=0.0)
+        X     = row.values
 
         try:
             signals, confs, votes = self.predict_with_confidence(X)
@@ -488,7 +680,7 @@ class StackedEnsemble:
             "atr_norm":   float(latest["atr_norm"].iloc[0]) if "atr_norm" in latest.columns else 1.0,
             "close":      float(latest["close"].iloc[0]),
             "bar_time":   df_feat.index[-1],
-            "tradeable":  conf >= MIN_CONFIDENCE and sig != 0,
+            "tradeable":  sig != 0,   # threshold already applied in predict_with_confidence
         }
 
     # ── Feature importance ────────────────────────────────────

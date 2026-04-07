@@ -25,13 +25,13 @@ from typing import Optional
 import numpy as np
 import pandas as pd
 
-from risk.portfolio_optimizer import optimise_weights, estimate_covariance
+from risk.portfolio_optimizer import optimise_weights, estimate_covariance, estimate_expected_returns
 
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(__file__)))
 from config.settings import (
     MIN_BARS_BETWEEN_TRADES, STRATEGY_WEIGHTS, MIN_CONFIDENCE, REBALANCE_HOURS,
-    FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS,
+    FOREX_PAIRS, EQUITY_TICKERS, COMMODITY_TICKERS, INSTRUMENT_MIN_CONFIDENCE,
 )
 from signals.regime import RegimeTracker, strategy_weights_by_regime
 from risk.engine    import RiskEngine
@@ -165,8 +165,9 @@ class PortfolioManager:
     manages portfolio-level risk, and coordinates execution.
     """
 
-    def __init__(self, risk_engine: RiskEngine):
+    def __init__(self, risk_engine: RiskEngine, pipeline=None):
         self.risk           = risk_engine
+        self.pipeline       = pipeline          # DataPipeline — for live covariance
         self.regime_tracker = RegimeTracker()
         self._strategy_pnl  = {s: 0.0 for s in STRATEGY_WEIGHTS}
         self._weights       = dict(STRATEGY_WEIGHTS)
@@ -222,21 +223,20 @@ class PortfolioManager:
 
         dominant = self.regime_tracker.dominant_regime()
 
-        if ml_conf >= 0.50 and ml_signal != 0:  
-            # Don't override if signal contradicts dominant regime
-            regime_allows_long  = dominant != "trending_down"
-            regime_allows_short = dominant != "trending_up"
+        if ml_conf >= 0.50 and ml_signal != 0:
+            # No opposing strategy → ML confidence applied directly.
+            # Regime gating is handled downstream by the HTF filter in run_paper().
+            if ml_signal == 1 and strategy_short == 0:
+                long_score  = max(long_score,  ml_conf)
+            if ml_signal == -1 and strategy_long == 0:
+                short_score = max(short_score, ml_conf)
 
-            if ml_signal == 1 and strategy_short == 0 and regime_allows_long:
-                long_score  = max(long_score,  ml_conf * 0.85)
-            if ml_signal == -1 and strategy_long == 0 and regime_allows_short:
-                short_score = max(short_score, ml_conf * 0.85)
-
-        # Determine final signal
-        if long_score > short_score and long_score >= MIN_CONFIDENCE:
+        # Determine final signal — use per-instrument threshold if available
+        _min_conf = INSTRUMENT_MIN_CONFIDENCE.get(ticker, MIN_CONFIDENCE)
+        if long_score > short_score and long_score >= _min_conf:
             final_signal = 1
             final_conf   = long_score
-        elif short_score > long_score and short_score >= MIN_CONFIDENCE:
+        elif short_score > long_score and short_score >= _min_conf:
             final_signal = -1
             final_conf   = short_score
         else:
@@ -277,6 +277,12 @@ class PortfolioManager:
         regime  = signal_dict["regime"]
 
         if signal == 0:
+            conf_str = f"{signal_dict.get('confidence', 0):.2%}"
+            long_s   = signal_dict.get("long_score", 0)
+            short_s  = signal_dict.get("short_score", 0)
+            _thr     = INSTRUMENT_MIN_CONFIDENCE.get(ticker, MIN_CONFIDENCE)
+            if max(long_s, short_s) < _thr:
+                return False, f"conf {conf_str} below threshold {_thr:.0%}", {}
             return False, "Strategies disagree", {}
         
         # Add at the top of should_execute, after signal == 0 check:
@@ -311,14 +317,23 @@ class PortfolioManager:
         if not allowed:
             return False, reason, {}
 
+        # HMM regime context for position sizing
+        vol_forecast  = self.regime_tracker.get_vol_forecast(ticker)
+        in_transition = self.regime_tracker.is_in_transition(ticker)
+
         # Compute position size
         sizing = self.risk.position_size(
-            instrument=ticker,
-            entry=close,
-            atr=atr,
-            regime=regime,
-            confidence=conf,
+            instrument    = ticker,
+            entry         = close,
+            atr           = atr,
+            regime        = regime,
+            confidence    = conf,
+            vol_forecast  = vol_forecast,
+            in_transition = in_transition,
         )
+
+        if sizing is None:
+            return False, "high_volatility + low_confidence", {}
 
         # Compute SL/TP
         sl, tp = self.risk.sl_tp(close, signal, atr, ticker)
@@ -345,11 +360,24 @@ class PortfolioManager:
             )
             n = max(len(all_tickers), 1)
 
-            # Use identity covariance as placeholder when we don't yet
-            # have a cross-asset returns DataFrame available at this point.
-            cov = estimate_covariance(None) if n == 1 else np.eye(n) * 0.0001
+            # Build live returns matrix from pipeline store when available.
+            returns_df = None
+            if self.pipeline is not None:
+                frames = {}
+                for t in all_tickers:
+                    df_t = self.pipeline.get(t)
+                    if not df_t.empty and "close" in df_t.columns and len(df_t) >= 30:
+                        frames[t] = df_t["close"].pct_change().dropna()
+                if len(frames) >= 2:
+                    returns_df = pd.DataFrame(frames).dropna()
+                    # Align column order to all_tickers
+                    returns_df = returns_df.reindex(columns=all_tickers)
 
-            mu = np.full(n, 0.0001)   # flat prior — equal expected return
+            cov = estimate_covariance(returns_df) if returns_df is not None and not returns_df.empty \
+                  else (np.eye(1) if n == 1 else np.eye(n) * 0.0001)
+
+            mu = estimate_expected_returns(returns_df) if returns_df is not None and not returns_df.empty \
+                 else np.full(n, 0.0001)
 
             opt_weights = optimise_weights(
                 tickers          = all_tickers,

@@ -66,8 +66,8 @@ def fetch_market_fear_greed() -> Optional[float]:
         _cache["market_fg"]["ts"]    = datetime.now(timezone.utc)
         logger.debug(f"CNN Fear & Greed: {score:.1f}")
         return score
-    except Exception as e:
-        logger.warning(f"CNN Fear & Greed fetch failed: {e}")
+    except Exception:
+        logger.debug("CNN Fear & Greed unavailable — returning neutral 50")
         return None
 
 
@@ -90,8 +90,8 @@ def fetch_crypto_fear_greed() -> Optional[float]:
         _cache["crypto_fg"]["ts"]    = datetime.now(timezone.utc)
         logger.debug(f"Crypto Fear & Greed: {score:.1f}")
         return score
-    except Exception as e:
-        logger.warning(f"Crypto Fear & Greed fetch failed: {e}")
+    except Exception:
+        logger.debug("Crypto Fear & Greed unavailable — returning neutral 50")
         return None
 
 

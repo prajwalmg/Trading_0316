@@ -136,6 +136,7 @@ class Dashboard:
         regime_map:     dict,
         portfolio_summary: dict,
         cycle:      int = 0,
+        regime_tracker = None,   # RegimeTracker instance for confidence/vol/transition
     ):
         """
         Render the full dashboard. Clears terminal first.
@@ -228,15 +229,34 @@ class Dashboard:
         dom = portfolio_summary.get("dominant_regime", "unknown")
         lines.append(self._row("Portfolio Dominant", regime_colour(dom)))
 
-        items = list(regime_map.items())[:12]   # Show max 12
-        for i in range(0, len(items), 3):
-            row_items = items[i:i+3]
-            row = "  "
-            for ticker, regime in row_items:
-                t_str = f"{ticker:<14}"
-                r_str = regime_colour(regime)
-                row  += grey(t_str) + r_str + "   "
-            lines.append(row)
+        if regime_tracker is not None and regime_map:
+            # Extended HMM display: one row per instrument
+            hdr = grey(f"  {'Ticker':<14}{'Regime':<18}{'Conf':>6}  {'Vol':>6}  {'Status'}")
+            lines.append(hdr)
+            lines.append(grey("  " + "─" * 60))
+            for ticker, regime in list(regime_map.items())[:12]:
+                conf_r   = regime_tracker.get_regime_confidence(ticker)
+                vol_fct  = regime_tracker.get_vol_forecast(ticker)
+                in_trans = regime_tracker.is_in_transition(ticker)
+                conf_str = f"{conf_r:.0%}"
+                vol_str  = f"{vol_fct:.4f}"
+                flag     = yellow(" TRANSITION") if in_trans else ""
+                lines.append(
+                    f"  {bold(ticker):<14}"
+                    f"{regime_colour(regime):<28}"
+                    f"{grey(conf_str):>14}  "
+                    f"{grey(vol_str):>14}"
+                    f"{flag}"
+                )
+        else:
+            # Compact fallback (no tracker available)
+            items = list(regime_map.items())[:12]
+            for i in range(0, len(items), 3):
+                row_items = items[i:i+3]
+                row = "  "
+                for ticker, regime in row_items:
+                    row += grey(f"{ticker:<14}") + regime_colour(regime) + "   "
+                lines.append(row)
         lines.append("")
 
         # ── Strategy Weights ─────────────────────────────────
