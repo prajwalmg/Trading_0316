@@ -35,6 +35,14 @@ IBKR_CLIENT_ID = 10
 TELEGRAM_BOT_TOKEN = "8735513793:AAHHPDvtFYqRWf53MgMew0lGLROZp4jOp0g"
 TELEGRAM_CHAT_ID   = "601840484"
 
+# All recipients receive every alert.
+# Add new chat IDs here — no code changes needed anywhere else.
+TELEGRAM_RECIPIENTS = [
+    "601840484",   # Primary (existing)
+    "7178665732",
+    "624908611",
+]
+
 # ══════════════════════════════════════════════════════════════
 #  FOREX  (46 pairs — all free on IBKR IDEALPRO)
 # ══════════════════════════════════════════════════════════════

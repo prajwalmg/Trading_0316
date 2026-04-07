@@ -26,16 +26,25 @@ DIRECTION_EMOJI = {
 def _send(message):
     try:
         from config.settings import (
-            TELEGRAM_BOT_TOKEN, TELEGRAM_CHAT_ID)
+            TELEGRAM_BOT_TOKEN, TELEGRAM_RECIPIENTS)
         if not TELEGRAM_BOT_TOKEN: return False
-        r = requests.post(
-            f"https://api.telegram.org/"
-            f"bot{TELEGRAM_BOT_TOKEN}/sendMessage",
-            json={"chat_id":TELEGRAM_CHAT_ID,
-                  "text":message,
-                  "parse_mode":"HTML"},
-            timeout=5)
-        return r.status_code == 200
+        url = (f"https://api.telegram.org/"
+               f"bot{TELEGRAM_BOT_TOKEN}/sendMessage")
+        ok = True
+        for chat_id in TELEGRAM_RECIPIENTS:
+            try:
+                r = requests.post(
+                    url,
+                    json={"chat_id":    chat_id,
+                          "text":       message,
+                          "parse_mode": "HTML"},
+                    timeout=5)
+                if r.status_code != 200:
+                    ok = False
+            except Exception as e:
+                logger.warning(f"Telegram send failed for {chat_id}: {e}")
+                ok = False
+        return ok
     except Exception as e:
         logger.warning(f"Telegram: {e}")
         return False
