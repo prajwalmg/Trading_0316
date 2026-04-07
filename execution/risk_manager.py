@@ -76,13 +76,22 @@ class SessionRiskManager:
             self.session_start = nav
             logger.info(f"SessionRisk: session start NAV = {nav:.2f}")
 
-    def can_trade(self, instrument: str, current_nav: float) -> tuple:
+    def can_trade(self, instrument: str, current_nav: float,
+                 open_count: int = 0) -> tuple:
         """
         Returns (True, 'OK') if a new trade is allowed.
         Returns (False, reason_str) if blocked.
+
+        open_count: number of currently open positions (caller passes
+                    len(broker.positions)); used to enforce a hard cap on
+                    simultaneous open positions.
         """
         try:
             self._check_date_reset()
+
+            # 0 — Simultaneous open positions cap
+            if open_count >= 4:
+                return False, f"Max 4 simultaneous open positions ({open_count} open)"
 
             # 1 — Session halted?
             if self.halted:

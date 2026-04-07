@@ -1105,7 +1105,8 @@ def run_intraday(capital: float = INITIAL_CAPITAL, poll_seconds: int = 300):
                         continue
 
                     # Session risk gate
-                    _ok, _reason = session_risk.can_trade(ticker, nav)
+                    _ok, _reason = session_risk.can_trade(
+                        ticker, nav, open_count=len(broker.positions))
                     if not _ok:
                         logger.info(f"[intraday] {ticker}: session risk blocked — {_reason}")
                         continue
@@ -1555,7 +1556,9 @@ if __name__ == "__main__":
         run_paper(args.instruments, args.capital, args.poll)
 
     elif args.mode == "intraday":
-        run_intraday(args.capital, args.poll)
+        from config.settings import INTRADAY_POLL_SECONDS
+        _intraday_poll = args.poll if "--poll" in sys.argv else INTRADAY_POLL_SECONDS
+        run_intraday(args.capital, _intraday_poll)
 
     elif args.mode == "multi":
         run_multi_asset(args.capital, args.poll)

@@ -146,6 +146,8 @@ DATA_PERIODS = {
 }
 
 # ── Data ──────────────────────────────────────────────────────
+INTRADAY_POLL_SECONDS = 300   # 5-minute cycle for intraday (5m bars)
+
 GRANULARITY     = "1h"
 LOOKBACK_PERIOD = "1Y"
 DAILY_PERIOD    = "2Y"
